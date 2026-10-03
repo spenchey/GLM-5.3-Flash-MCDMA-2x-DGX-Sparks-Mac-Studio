@@ -1,0 +1,35 @@
+[
+  {
+    "id": "B1-decode",
+    "prompt": "Output the integers from 1 through 2000 in order, separated only by commas. Do not explain and do not stop early.",
+    "max_tokens": 128
+  },
+  {
+    "id": "B2-long-decode",
+    "prompt": "Output the integers from 1 through 20000 in order, separated only by commas. Do not explain and do not stop early.",
+    "max_tokens": 1024
+  },
+  {
+    "id": "B3-first-token-64",
+    "target_prompt_tokens": 64,
+    "seed": 6401,
+    "max_tokens": 1
+  },
+  {
+    "id": "B3-first-token-512",
+    "target_prompt_tokens": 512,
+    "seed": 51201,
+    "max_tokens": 1
+  },
+  {
+    "id": "B3-first-token-2040",
+    "target_prompt_tokens": 2040,
+    "seed": 204001,
+    "max_tokens": 1
+  },
+  {
+    "id": "B4-realistic",
+    "prompt": "You operate a small three-machine inference service. Write a concise incident runbook for a request that stalls after the Mac has produced its first-stage activation but before both GPU workers commit the token. Cover detection, evidence preservation, safe shutdown, recovery, validation, and prevention. Distinguish facts from assumptions, do not invent commands, and make each step actionable for an operator. Include how to prove that the Mac stage, the transport, and both GPU workers took part in the recovered request. End with a short checklist that can be copied into an incident ticket.",
+    "max_tokens": 256
+  }
+]

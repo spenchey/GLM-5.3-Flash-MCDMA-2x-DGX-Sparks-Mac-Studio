@@ -1,0 +1,16 @@
+name: Public release checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  public-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check notices, secrets, paths, and model artifacts
+        run: python3 scripts/check-public-release.py

@@ -1,0 +1,290 @@
+diff --git a/tools/native_cross_host.py b/tools/native_cross_host.py
+index 337cf0d..47c2c02 100644
+--- a/tools/native_cross_host.py
++++ b/tools/native_cross_host.py
+@@ -48,6 +48,10 @@ def ndp_has_neighbor(output, gid, interface, address):
+     return False
+
+
++class EndpointCleanupError(RuntimeError):
++    """An endpoint survived every permitted bounded cleanup step."""
++
++
+ class Endpoint:
+     STDERR_LIMIT = 1024 * 1024
+
+@@ -114,6 +118,7 @@ class Endpoint:
+         self.process.stdin.flush()
+
+     def stop(self):
++        cleanup_error = None
+         try:
+             self.process.stdin.close()
+         except BrokenPipeError:
+@@ -125,8 +130,9 @@ class Endpoint:
+             try:
+                 self.process.wait(timeout=5)
+             except subprocess.TimeoutExpired:
+-                self.process.kill()
+-                self.process.wait()
++                cleanup_error = EndpointCleanupError(
++                    f'{self.host}: endpoint pid {self.process.pid} survived stdin close, '
++                    '15s wait, SIGTERM, and 5s wait')
+             code = -1
+         # Preserve CQ/posting diagnostics even when the endpoint returned a
+         # well-formed failure response before exiting.
+@@ -143,6 +149,8 @@ class Endpoint:
+         if stderr:
+             self.log.append({'host': self.host, 'endpoint_stderr': stderr})
+             print(f'{self.host}: {stderr.strip()}', flush=True)
++        if cleanup_error is not None:
++            raise cleanup_error
+         return code
+
+
+diff --git a/benchmarks/run_bw.py b/benchmarks/run_bw.py
+index 14338b4..3e5d2e9 100644
+--- a/benchmarks/run_bw.py
++++ b/benchmarks/run_bw.py
+@@ -20,6 +20,7 @@ from pathlib import Path
+ import re
+ import selectors
+ import shlex
++import signal
+ import subprocess
+ import sys
+ import time
+@@ -35,6 +36,25 @@ INITIATORS = ('mac', 'peer')
+ CSV_PREFIX = ['initiator', 'round', 'mode_confirmed']
+
+
++class CleanupSignals:
++    """Turn external termination into the same cleanup path as interruption."""
++
++    SIGNALS = (signal.SIGTERM, signal.SIGHUP)
++
++    def install(self):
++        self.previous = {signum: signal.getsignal(signum) for signum in self.SIGNALS}
++        for signum in self.SIGNALS:
++            signal.signal(signum, self._interrupt)
++
++    def restore(self):
++        for signum, handler in self.previous.items():
++            signal.signal(signum, handler)
++
++    @staticmethod
++    def _interrupt(signum, _frame):
++        raise KeyboardInterrupt(signal.Signals(signum).name)
++
++
+ def parse_list(text, kind, allowed=None, low=None, high=None):
+     items = [item.strip() for item in text.split(',') if item.strip()]
+     if not items:
+@@ -378,6 +398,8 @@ def main(argv=None):
+             raise RuntimeError('Linux peer needs the Mac static IPv6 neighbour before QP connection')
+
+     exit_code = 0
++    cleanup_signals = CleanupSignals()
++    cleanup_signals.install()
+     try:
+         for item in plan:
+             name = config_name(item)
+@@ -407,7 +429,7 @@ def main(argv=None):
+                         record[f'{"mac" if endpoint.host == args.mac_host else "peer"}_returncode'] = code
+                         if code:
+                             errors.append(f'{endpoint.host}: exit {code}')
+-                    except (OSError, subprocess.SubprocessError) as error:
++                    except (OSError, cross.EndpointCleanupError, subprocess.SubprocessError) as error:
+                         errors.append(f'{endpoint.host}: cleanup failed: {error}')
+             stderr = ''.join(entry.get('endpoint_stderr', '') for entry in log if entry.get('host') == args.mac_host)
+             cqs = item['qps'] if item['cq_per_qp'] else 1
+@@ -435,9 +457,12 @@ def main(argv=None):
+             manifest['runs'].append(record)
+             if errors:
+                 break
+-    except KeyboardInterrupt:
+-        manifest['errors'].append('interrupted')
++    except KeyboardInterrupt as error:
++        detail = str(error)
++        manifest['errors'].append('interrupted' + (f': {detail}' if detail else ''))
+         exit_code = 1
++    finally:
++        cleanup_signals.restore()
+     for csv_path in sorted(args.output.glob('*.csv')):
+         manifest['csv_sha256'][csv_path.name] = sha256_file(csv_path)
+     write_manifest()
+diff --git a/tests/test_native_endpoint.py b/tests/test_native_endpoint.py
+index f3df2bb..5902361 100644
+--- a/tests/test_native_endpoint.py
++++ b/tests/test_native_endpoint.py
+@@ -3,8 +3,9 @@ import importlib.util
+ from pathlib import Path
+ import subprocess
+ import sys
++import threading
+ import unittest
+-from unittest.mock import patch
++from unittest.mock import Mock, call, patch
+
+ spec = importlib.util.spec_from_file_location('native_cross_host', Path(__file__).resolve().parents[1]/'tools/native_cross_host.py')
+ module = importlib.util.module_from_spec(spec)
+@@ -52,6 +53,45 @@ class EndpointTests(unittest.TestCase):
+             self.assertEqual(endpoint.stop(), 0)
+         self.assertEqual(log[-1]['endpoint_stderr'], 'firmware failure\n')
+
++    def mocked_endpoint(self, waits):
++        endpoint = object.__new__(module.Endpoint)
++        endpoint.host = 'offline-child'
++        endpoint.log = []
++        endpoint.pending = b''
++        endpoint.stderr_data = bytearray()
++        endpoint.stderr_overflow = False
++        endpoint.stderr_error = None
++        endpoint.stderr_stop = threading.Event()
++        endpoint.stderr_thread = Mock()
++        endpoint.stderr_thread.is_alive.return_value = False
++        endpoint.process = Mock()
++        endpoint.process.pid = 4321
++        endpoint.process.wait.side_effect = waits
++        return endpoint
++
++    def test_stop_normal_exit_never_forces_kill(self):
++        endpoint = self.mocked_endpoint([0])
++        self.assertEqual(endpoint.stop(), 0)
++        endpoint.process.wait.assert_called_once_with(timeout=15)
++        endpoint.process.terminate.assert_not_called()
++        endpoint.process.kill.assert_not_called()
++
++    def test_stop_timeout_uses_sigterm_then_exits_nonzero(self):
++        endpoint = self.mocked_endpoint([subprocess.TimeoutExpired('ssh', 15), 143])
++        self.assertEqual(endpoint.stop(), -1)
++        self.assertEqual(endpoint.process.wait.call_args_list, [call(timeout=15), call(timeout=5)])
++        endpoint.process.terminate.assert_called_once_with()
++        endpoint.process.kill.assert_not_called()
++
++    def test_stop_surviving_child_reports_pid_and_never_forces_kill(self):
++        endpoint = self.mocked_endpoint([
++            subprocess.TimeoutExpired('ssh', 15), subprocess.TimeoutExpired('ssh', 5)])
++        with self.assertRaisesRegex(module.EndpointCleanupError, 'pid 4321 survived.*SIGTERM'):
++            endpoint.stop()
++        self.assertEqual(endpoint.process.wait.call_args_list, [call(timeout=15), call(timeout=5)])
++        endpoint.process.terminate.assert_called_once_with()
++        endpoint.process.kill.assert_not_called()
++
+
+ if __name__ == '__main__':
+     unittest.main()
+diff --git a/tests/test_bw_tools.py b/tests/test_bw_tools.py
+index 63e0c5f..a7d2404 100644
+--- a/tests/test_bw_tools.py
++++ b/tests/test_bw_tools.py
+@@ -1,11 +1,13 @@
+ """Offline checks for the bandwidth sweep runner and summariser; no SSH or hardware."""
+ import importlib.util
+ import io
++import json
+ import os
+ from pathlib import Path
++import signal
+ import tempfile
+ import unittest
+-from unittest.mock import patch
++from unittest.mock import Mock, patch
+
+ ROOT = Path(__file__).resolve().parents[1]
+
+@@ -108,6 +110,94 @@ class SweepTests(unittest.TestCase):
+             with self.subTest(extra=extra), patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit):
+                 run_bw.main(BASE_ARGS + extra + ['--output', '/nonexistent/test-output', '--dry-run'])
+
++    def run_interrupted(self, signum):
++        endpoints = []
++
++        class Endpoint:
++            def __init__(self, host, _command, _log):
++                self.host = host
++                self.process = Mock()
++                self.process.stdout.fileno.return_value = 1
++                endpoints.append(self)
++
++            def stop(self):
++                self.stopped = True
++                return 0
++
++        def remote(command, **_kwargs):
++            target = command[-1]
++            stdout = ''
++            if 'gid_attrs/types/' in target:
++                stdout = 'RoCE v2\n'
++            elif 'gid_attrs/ndevs/' in target:
++                stdout = 'enp9s0\n'
++            elif 'sha256sum ' in target or 'shasum -a 256 ' in target:
++                stdout = 'a' * 64 + '  fixture\n'
++            return Mock(returncode=0, stdout=stdout, stderr='')
++
++        def interrupt(_relay):
++            signal.raise_signal(signum)
++
++        with tempfile.TemporaryDirectory() as directory, \
++                patch.object(run_bw.cross, 'Endpoint', Endpoint), \
++                patch.object(run_bw.Relay, 'run', interrupt), \
++                patch.object(run_bw.subprocess, 'run', remote), \
++                patch('builtins.print'):
++            code = run_bw.main(BASE_ARGS + ['--ops', 'write', '--sizes', '4096', '--depths', '1',
++                                            '--qps', '1', '--initiators', 'mac', '--repeats', '1',
++                                            '--output', str(Path(directory) / 'sweep')])
++            manifest = json.loads((Path(directory) / 'sweep' / 'manifest.json').read_text())
++        self.assertEqual(code, 1)
++        self.assertEqual(len(endpoints), 2)
++        self.assertTrue(all(endpoint.stopped for endpoint in endpoints))
++        self.assertIn(signal.Signals(signum).name, manifest['errors'][-1])
++
++    def test_sigterm_routes_through_endpoint_cleanup(self):
++        self.run_interrupted(signal.SIGTERM)
++
++    def test_sighup_routes_through_endpoint_cleanup(self):
++        self.run_interrupted(signal.SIGHUP)
++
++    def test_surviving_endpoint_makes_run_nonzero(self):
++        endpoints = []
++
++        class Endpoint:
++            def __init__(self, host, _command, _log):
++                self.host = host
++                self.process = Mock()
++                self.process.stdout.fileno.return_value = 1
++                endpoints.append(self)
++
++            def stop(self):
++                raise run_bw.cross.EndpointCleanupError(
++                    f'{self.host}: endpoint pid 4321 survived stdin close, 15s wait, SIGTERM, and 5s wait')
++
++        def remote(command, **_kwargs):
++            target = command[-1]
++            stdout = ''
++            if 'gid_attrs/types/' in target:
++                stdout = 'RoCE v2\n'
++            elif 'gid_attrs/ndevs/' in target:
++                stdout = 'enp9s0\n'
++            elif 'sha256sum ' in target or 'shasum -a 256 ' in target:
++                stdout = 'a' * 64 + '  fixture\n'
++            return Mock(returncode=0, stdout=stdout, stderr='')
++
++        with tempfile.TemporaryDirectory() as directory, \
++                patch.object(run_bw.cross, 'Endpoint', Endpoint), \
++                patch.object(run_bw.Relay, 'run', side_effect=RuntimeError('offline stop')), \
++                patch.object(run_bw.subprocess, 'run', remote), \
++                patch('builtins.print'):
++            output = Path(directory) / 'sweep'
++            code = run_bw.main(BASE_ARGS + ['--ops', 'write', '--sizes', '4096', '--depths', '1',
++                                            '--qps', '1', '--initiators', 'mac', '--repeats', '1',
++                                            '--output', str(output)])
++            manifest = json.loads((output / 'manifest.json').read_text())
++        self.assertEqual(code, 1)
++        self.assertEqual(len(endpoints), 2)
++        self.assertIn('cleanup failed', ' '.join(manifest['runs'][0]['errors']))
++        self.assertIn('pid 4321 survived', ' '.join(manifest['runs'][0]['errors']))
++
+     def test_descriptor_validation(self):
+         good = ('ENDPOINT v=1 nonce=7 role=initiator op=write bytes=65536 depth=16 qps=2 cqpq=0 cqe=31 total=67108864 '
+                 'mtu=1024 imm_recv=0 rd=1 psn=6636321 rkey=4660 addr=4294967296 length=2113536 gid=fe80::ff:fe00:1 qpn=17,18')

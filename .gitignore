@@ -1,0 +1,13 @@
+config.local.env
+.private-markers
+.state/
+.context/
+results/raw/
+*.log
+*.exit
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/

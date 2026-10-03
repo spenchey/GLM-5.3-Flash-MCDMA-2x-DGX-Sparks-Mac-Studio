@@ -1,0 +1,50 @@
+[
+  {
+    "id": "E1-fusionne-tries",
+    "validator": "python_symbols",
+    "expected": ["fusionne_tries"],
+    "prompt": "Écris une fonction Python `fusionne_tries(listes)` qui fusionne une liste de listes triées en une seule liste triée, en O(N log k) avec heapq. Réponds uniquement avec le code."
+  },
+  {
+    "id": "E2-arithmetique",
+    "validator": "integer",
+    "expected": 1651,
+    "prompt": "Calcule exactement 37 × 48 − 125. Réponds uniquement avec l'entier, sans explication ni ponctuation."
+  },
+  {
+    "id": "E3-extraction-json",
+    "validator": "exact_json",
+    "expected": {"client": "Lina", "priorite": 2, "produits": ["freins", "pneus"]},
+    "prompt": "Extrais les données de cette note : « Cliente Lina; priorité 2; produits demandés: freins puis pneus. » Réponds uniquement avec ce JSON exact, sans bloc de code : {\"client\":\"Lina\",\"priorite\":2,\"produits\":[\"freins\",\"pneus\"]}"
+  },
+  {
+    "id": "E4-diagnostic-systeme",
+    "validator": "contains_all",
+    "expected": ["transport", "application", "identité"],
+    "prompt": "En français, explique en 3 phrases pourquoi un port réseau ouvert ne prouve pas qu'un service d'inférence correct fonctionne. Tu dois employer exactement les mots transport, application et identité."
+  },
+  {
+    "id": "E5-explication-longue",
+    "validator": "min_words",
+    "expected": 120,
+    "prompt": "Explique en français, en au moins 120 mots, comment comparer équitablement deux réglages d'un moteur d'inférence sans confondre une vraie amélioration avec le bruit de mesure."
+  },
+  {
+    "id": "E6-lru",
+    "validator": "python_symbols",
+    "expected": ["LRU"],
+    "prompt": "Écris une classe Python `LRU(capacite)` avec `get(cle)` (renvoie -1 si absente) et `put(cle, valeur)`, éviction du moins récemment utilisé, O(1). Réponds uniquement avec le code."
+  },
+  {
+    "id": "E7-liste-json",
+    "validator": "exact_json",
+    "expected": [1, 2, 3, 5, 8, 13],
+    "prompt": "Trie et déduplique la liste [13, 3, 5, 3, 2, 8, 1, 5]. Réponds uniquement avec le tableau JSON exact, sans bloc de code."
+  },
+  {
+    "id": "E8-logique",
+    "validator": "contains_all",
+    "expected": ["B", "D"],
+    "prompt": "Quatre étapes A, B, C, D ont les contraintes A avant C, B avant C et C avant D. Donne un ordre valide en une seule ligne et indique ensuite quelles étapes peuvent commencer immédiatement. Ta réponse doit contenir B et D."
+  }
+]

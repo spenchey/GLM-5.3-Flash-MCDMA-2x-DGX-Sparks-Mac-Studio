@@ -1,0 +1,255 @@
+{
+  "benchmark_specs_sha256": "0bcc75ce6306a9fd23403acf6523fd68736e2981f175833f2d4888cd15cf878c",
+  "captured_at_unix_ns": 1790956421771010000,
+  "entries": {
+    "B1-decode": {
+      "completion_tokens": 128,
+      "finish_reason": "length",
+      "max_tokens": 128,
+      "output_sha256": "bd541e7d43f21cd13484ec80ee2798a40e93e5312009084046a1b6c1faea169c",
+      "prompt": "Output the integers from 1 through 2000 in order, separated only by commas. Do not explain and do not stop early.",
+      "prompt_sha256": "d70c95ae5ce94cb7bcff2612a6f79a5e32b7c2e5c6cff3a8fd3ac2ff63ed3cd9",
+      "prompt_tokens": 33,
+      "suite": "benchmark",
+      "token_ids_sha256": "903603fec7685c1303fe194aefa8c2b8fa44a476a9d0183de8f2a0edadb0b14a"
+    },
+    "B2-long-decode": {
+      "completion_tokens": 1024,
+      "finish_reason": "length",
+      "max_tokens": 1024,
+      "output_sha256": "a8e44ff6a2917bda1129182b40a00e76bbab7caa5bcfc56a9ef8f705978ff86e",
+      "prompt": "Output the integers from 1 through 20000 in order, separated only by commas. Do not explain and do not stop early.",
+      "prompt_sha256": "8fc2bae00deecb506c80d50afbf35e5070860b81ea5539f4a3b6167881d92258",
+      "prompt_tokens": 33,
+      "suite": "benchmark",
+      "token_ids_sha256": "a60c8c96f945beb5d6a189d57d49d799a6b113e704af2fda4fde6cf39b2fb6fb"
+    },
+    "B3-first-token-2040": {
+      "completion_tokens": 1,
+      "finish_reason": "length",
+      "max_tokens": 1,
+      "output_sha256": "b24d6d33736ecd5604a4b17bc9c6481039fac362bb7df044ef1c10a2bfd21db6",
+      "prompt": "Read this context, then answer with only the word ready. team area person school method group school job window theory health market head. change voice fact minute market company side head law fact question body job. member number word art person theory game health hour game field community bridge. signal signal health life body school signal health world program method information thing. mountain thing program fact business book window business city community life law window. number member case question job end research minute winter room hour member method. program hour result line result market garden information system idea system company mountain. change idea end area hand city week team law service person issue winter. place study change market game history hand health body change member school city. job market law work life book name word idea line point people body. theory research life reason power health theory change people work mountain result word. day member power signal place way number week change river case home name. company method home office river bridge signal company voice community kind head book. country day company art art people case river market people engine program problem. voice signal name engine team way service place book program problem work job. signal time city year thing history room problem head fact point group job. line member book head voice story work area health people question kind history. company story information fact area information end study issue health week field garden. art story bridge group state work room game book side field story people. theory theory story day minute point power problem day case group state reason. river country history line line winter story community theory area body country state. garden business hand business engine thing state friend water work people week people. history state game window method book group change state case hand people change. body hand letter group engine signal result life bridge paper paper number problem. window way world minute member minute minute country idea hour company game mountain. time thing study body letter world member study game world field community group. line end time friend line company system side mountain problem number information side. history engine voice state city name law group kind window research fact voice. question world information week place bridge game body hour friend window kind person. voice art window room hand life line reason world home service hour method. question person line idea world way friend community issue theory time people thing. side system way point school reason friend minute case problem hour job field. time home work hour head city day point history book idea change voice. area result way country river system system garden friend information book way river. friend people people study story end city field member point game research end. power member fact area friend theory world question question member garden method line. friend day idea voice hand result voice hour team field story head story. winter art case body art problem way market field problem power result friend. business point head river school minute place line week paper signal community method. state company market people word law way person office problem bridge water engine. research bridge bridge study result people minute law people minute word side area. state idea community garden mountain day community group word case information world problem. change friend hour story kind head name work area method business country week. hour water person home winter side window body story work people engine business. law hour team hour place bridge paper bridge engine program problem side body. case friend body case law question bridge fact word area engine program mountain. engine result end system winter area number job room side side hour information. signal market state home people country place room line method city hand year. city voice power area end book thing body story time kind line winter. art system minute result word home game number history game word thing problem. time friend health end country city game hand mountain room voice hour information. river year company garden world law idea water research place team information winter. number name history garden art thing head question research office voice line health. market head system way water point voice service field year number mountain system. people power work city water problem hand company team water market office body. program mountain way company team window question water problem book company city word. river area number day market engine kind person window side life art city. program mountain theory voice friend case life community kind theory bridge school company. people job case system game friend service person winter end thing result member. person program job kind day member water side time service field problem signal. change life friend work fact business river story head name company winter group. side office line research end company name story research home life thing paper. issue line mountain power information result service week result room bridge business name. health office friend work business window window information time group side home garden. program field city idea bridge method area case job garden office minute thing. reason week problem business result business friend issue case garden body word history. game minute work theory week letter mountain garden home office question company theory. end law idea word line end information river mountain story time garden day. idea people book head member home idea service word head place window room. week signal history paper issue home health information law idea time team program. group place time idea change market window number garden school game study power. law change letter art city day result city line team line work end. theory service field method health bridge bridge company system kind business thing garden. line job office time market number room window power garden water signal line. hand reason company system people group hand reason health program number line problem. signal team state problem power theory number line history service body letter line. problem game window health city body power line number law side paper community. state history bridge change hour job theory member hour head bridge end home. issue area state home time issue window result company service change home information. life year market office water idea country history number company bridge hour body. game game company friend hour place water day reason person paper home engine. theory fact company window bridge study letter thing book bridge health body change. week water program field friend thing team program question art question art team. office study paper business time idea group river service winter book art book. health way change case week theory story country power method kind question reason. team method art side idea information word member game country way hour group. game end study result city word body member river person year garden game. signal art voice time line theory area change information member minute reason body. community body program book window member program mountain city word health law issue. hour job week number information law voice place change word change law result. change name case name letter work member name river story friend job year. thing place law hour study line question member hand line number case word. day day idea system world name minute work art issue letter head story. information life world garden mountain paper information art hour company person minute place. minute window line water world community winter day work group group name point. information research year company friend window question kind game book community book change. history research bridge number study side home hour health room job theory office. way engine kind system garden study business way year engine way school state. method art room head team name state company theory information minute market winter. theory letter city service thing research art case research day service theory number. country river country office question result program end study company point question question. state book law hour river place point number art side power side voice. word kind people life word voice history change signal information reason idea program. state area business job fact game fact result point change team service water. body person state year story law problem method head research program life body. reason signal team service voice work minute person room people information business week. group story method game hand job state business way field history health year. life book country service case point way research fact health people program world. information engine time art method company method line way area body number issue. system story issue water home hour book group room hour way area reason. city person research group law life body state case question city life world. result minute book result engine field hour number place idea name book word. case life idea reason law word word field state change reason team hour. room state case system member market bridge power area group power people mountain. business place hand community point service mountain way name program area minute issue. signal name water week area story voice health job art book paper window. law engine power day minute study change city member kind room hand service. hand country hand point side book theory service day country room community law. name business state system result year head service day reason service state question. week power problem problem state garden member information time river business people problem. hand case change way water point room fact research engine engine result system. idea business issue market city winter school window change life city bridge area. change result job market history day law year kind idea way area letter. river community people minute year art year city point book theory garden research. theory body signal number kind people end life person winter side theory year. job information state kind game community story market garden body office year team. study head law day law point number city question fact friend study result. information team member kind system water bridge city body theory life work river. winter method information book day story name time program home health end mountain. window paper city place method mountain voice mountain home place year week point. hour service voice case market window day minute business kind hand theory problem. hour voice study mountain place garden issue life change power book reason group. research result name game garden mountain thing bridge method name minute head power. health city issue fact country power theory winter hand day kind water minute. week person result art office time garden line way power group fact game. issue market people window head result window bridge country line minute people community. end result year hand country life system person reason research field result study. line service power member result name paper name change problem word room program. point thing side study office body country way time company minute window body. issue school group water study game office window reason member group number art. information state hour community week law life game number country question game winter. hour name garden theory issue kind hand field law question law bridge theory. winter power system friend area engine business thing head home office thing problem. name power line office company hand state game point world head fact word. day history word winter name question",
+      "prompt_sha256": "261c749806b843bd9d47e52f896a5d4b9f9ebcf64eea19f81fe33f255c5c010c",
+      "prompt_tokens": 2040,
+      "suite": "benchmark",
+      "token_ids_sha256": "353650472e7d7016be396a1398680e010795c71595c0125577936904e4523c06"
+    },
+    "B3-first-token-512": {
+      "completion_tokens": 1,
+      "finish_reason": "length",
+      "max_tokens": 1,
+      "output_sha256": "b24d6d33736ecd5604a4b17bc9c6481039fac362bb7df044ef1c10a2bfd21db6",
+      "prompt": "Read this context, then answer with only the word ready. day field idea people hand line life world name kind side study day. end head service change life water team book health business country law mountain. city letter end case story state question winter friend problem power bridge friend. line study story river name hour water market fact water work market power. team job day thing garden world field day world state person work health. garden problem power problem voice history history job question window engine team result. history person week member river issue voice game voice winter market room market. question voice problem state home person life job garden body name history field. life way market signal business game power world idea life home office year. life area research country hour signal program study line week water change water. mountain minute hour world letter idea kind garden letter year school history market. case number person room law system job time change room head day member. law word case company system market problem research person office research school job. home voice place company area week people story field window life life job. health field art body community hour week end member field week law method. week life garden work engine information problem line research business game issue method. voice letter world question information window work bridge day health hand question time. country game game change work hour result reason market team room question point. room home program study thing body winter year way hand issue city change. voice point number service end bridge reason room country place hand country minute. window fact point problem research job question history history book city time week. fact signal research art method hour name way side voice system week law. community program job job work hour line idea problem market story company law. week program idea end program issue community office field week game law paper. book change research river idea letter power community point place place people word. engine business head hand story art theory day health power end reason end. field result day name place signal research side method work window area place. reason head thing life idea power signal history hour person kind hour voice. engine system issue end history line area idea kind week place bridge research. life member end minute window engine law time bridge hand research issue time. name country team company office issue number city team name history reason system. fact person person day problem person business river line question result information method. change office group result kind body result minute fact head story case body. group study window name problem friend program health water case field game method. reason reason health business room result engine idea thing member line people life. issue time bridge member",
+      "prompt_sha256": "99d582d3fbba884d48be166ff46581c0e4156275140f57d7a3fa656ca69fadff",
+      "prompt_tokens": 512,
+      "suite": "benchmark",
+      "token_ids_sha256": "353650472e7d7016be396a1398680e010795c71595c0125577936904e4523c06"
+    },
+    "B3-first-token-64": {
+      "completion_tokens": 1,
+      "finish_reason": "length",
+      "max_tokens": 1,
+      "output_sha256": "b24d6d33736ecd5604a4b17bc9c6481039fac362bb7df044ef1c10a2bfd21db6",
+      "prompt": "Read this context, then answer with only the word ready. company area side market line program theory person job body field country job. law friend minute result case bridge office water research state people market history. team company market body side change change city law name people problem hour. city member body group",
+      "prompt_sha256": "5cdeca35c85096c2fef8394ada626edd1d1ffba625fe2ef5336442c74a0e959a",
+      "prompt_tokens": 64,
+      "suite": "benchmark",
+      "token_ids_sha256": "353650472e7d7016be396a1398680e010795c71595c0125577936904e4523c06"
+    },
+    "B4-realistic": {
+      "completion_tokens": 256,
+      "finish_reason": "length",
+      "max_tokens": 256,
+      "output_sha256": "a03d629febff14a0cd983881e5abe36662e32f62877a70fd4307d529ae8dd7a4",
+      "prompt": "You operate a small three-machine inference service. Write a concise incident runbook for a request that stalls after the Mac has produced its first-stage activation but before both GPU workers commit the token. Cover detection, evidence preservation, safe shutdown, recovery, validation, and prevention. Distinguish facts from assumptions, do not invent commands, and make each step actionable for an operator. Include how to prove that the Mac stage, the transport, and both GPU workers took part in the recovered request. End with a short checklist that can be copied into an incident ticket.",
+      "prompt_sha256": "2477b513bcc3d824598f8cd6e947e352c9acd934edf710210686fcc30d0df10b",
+      "prompt_tokens": 117,
+      "suite": "benchmark",
+      "token_ids_sha256": "187a64af3d586704b2884942fde3749d06a0583cc5609f569aff4d6a58c7536f"
+    },
+    "E1-fusionne-tries": {
+      "completion_tokens": 265,
+      "expected": [
+        "fusionne_tries"
+      ],
+      "finish_reason": "stop",
+      "max_tokens": 1024,
+      "output_sha256": "ba9f7a0bcba7a6bfeb2b95e5e347948efa07d63db0f04c55d463fc92b6e642d3",
+      "prompt": "Écris une fonction Python `fusionne_tries(listes)` qui fusionne une liste de listes triées en une seule liste triée, en O(N log k) avec heapq. Réponds uniquement avec le code.",
+      "prompt_sha256": "872eccdbb61a92cf15c21a87d45565ded4c56105edbd6a4c364e25d710f49c1a",
+      "prompt_tokens": 54,
+      "suite": "equivalence",
+      "token_ids_sha256": "f5114f49517b7c90930007d7a58f81734bb21233d98fd5614ce8f89d4f3036c2",
+      "validator": "python_symbols"
+    },
+    "E2-arithmetique": {
+      "completion_tokens": 22,
+      "expected": 1651,
+      "finish_reason": "stop",
+      "max_tokens": 1024,
+      "output_sha256": "b6496a21abb5487364a1edc0508b074448fd66c2ba3a4f78ff7d426aff5516fd",
+      "prompt": "Calcule exactement 37 × 48 − 125. Réponds uniquement avec l'entier, sans explication ni ponctuation.",
+      "prompt_sha256": "f3027f4b660425dd30842201bb369d19bd047103befcb380dd59ea407d83854d",
+      "prompt_tokens": 37,
+      "suite": "equivalence",
+      "token_ids_sha256": "71d303c4d9d1ab8c234fe99462fef38c487efe8b74d3346c7347d20044c9ae46",
+      "validator": "integer"
+    },
+    "E3-extraction-json": {
+      "completion_tokens": 22,
+      "expected": {
+        "client": "Lina",
+        "priorite": 2,
+        "produits": [
+          "freins",
+          "pneus"
+        ]
+      },
+      "finish_reason": "stop",
+      "max_tokens": 1024,
+      "output_sha256": "620c8b090c1e7e7f84b0e7547816483fdd295bb9e15187fb982b210c6f5e324c",
+      "prompt": "Extrais les données de cette note : « Cliente Lina; priorité 2; produits demandés: freins puis pneus. » Réponds uniquement avec ce JSON exact, sans bloc de code : {\"client\":\"Lina\",\"priorite\":2,\"produits\":[\"freins\",\"pneus\"]}",
+      "prompt_sha256": "596c76d3dc74b1bb7e239d4573935d57cacf9f13e686d12ed63a37580c9ace74",
+      "prompt_tokens": 70,
+      "suite": "equivalence",
+      "token_ids_sha256": "b633206962964fb4ff1c3ba8a955947fa0e140556c7fb1fda38852bd6d318d0b",
+      "validator": "exact_json"
+    },
+    "E4-diagnostic-systeme": {
+      "completion_tokens": 90,
+      "expected": [
+        "transport",
+        "application",
+        "identité"
+      ],
+      "finish_reason": "stop",
+      "max_tokens": 1024,
+      "output_sha256": "07c95cd0d4458bb3ea797905de57545f4fec37f23c96f1157ef4b75416e5ee77",
+      "prompt": "En français, explique en 3 phrases pourquoi un port réseau ouvert ne prouve pas qu'un service d'inférence correct fonctionne. Tu dois employer exactement les mots transport, application et identité.",
+      "prompt_sha256": "10dcfcd6009efa20fd94fec4de3e94dfdebe2760e64b661df69d946faf9d2f30",
+      "prompt_tokens": 48,
+      "suite": "equivalence",
+      "token_ids_sha256": "b144bc4bfe37408ea2a884ccd4e79b9587b93175f1e931ad67463f481fc3703b",
+      "validator": "contains_all"
+    },
+    "E5-explication-longue": {
+      "completion_tokens": 410,
+      "expected": 120,
+      "finish_reason": "stop",
+      "max_tokens": 1024,
+      "output_sha256": "05f23125841a365e13a5deb1c72d1b87d9d6e217637af18cc2a385f5fdc4ced9",
+      "prompt": "Explique en français, en au moins 120 mots, comment comparer équitablement deux réglages d'un moteur d'inférence sans confondre une vraie amélioration avec le bruit de mesure.",
+      "prompt_sha256": "70fcb5d3703bb60def261aa6aea20fe780605f9c3803f87762c6fcf45e5e9972",
+      "prompt_tokens": 52,
+      "suite": "equivalence",
+      "token_ids_sha256": "02f58eaea277914cb93a8ca361da25230e0668a7526fa0ebd07bdf56c85694ea",
+      "validator": "min_words"
+    },
+    "E6-lru": {
+      "completion_tokens": 129,
+      "expected": [
+        "LRU"
+      ],
+      "finish_reason": "stop",
+      "max_tokens": 1024,
+      "output_sha256": "4eb37c882a9e4de7e23e98727d62f840f7ce71f7890b2e7411b10375ec6c84cb",
+      "prompt": "Écris une classe Python `LRU(capacite)` avec `get(cle)` (renvoie -1 si absente) et `put(cle, valeur)`, éviction du moins récemment utilisé, O(1). Réponds uniquement avec le code.",
+      "prompt_sha256": "57c9231894b4d259bdd2560cdbb14b172d5809210fa70281869330e0d0ea2c34",
+      "prompt_tokens": 64,
+      "suite": "equivalence",
+      "token_ids_sha256": "fd52923eb0e5b40edd8c441843b515dbcaa3866073cbbf62351d265ae50fdc5f",
+      "validator": "python_symbols"
+    },
+    "E7-liste-json": {
+      "completion_tokens": 19,
+      "expected": [
+        1,
+        2,
+        3,
+        5,
+        8,
+        13
+      ],
+      "finish_reason": "stop",
+      "max_tokens": 1024,
+      "output_sha256": "248b2e91dbf8174eb0256b4e8dc805137bf2f8fb1bd035b2daeff81a21c480ca",
+      "prompt": "Trie et déduplique la liste [13, 3, 5, 3, 2, 8, 1, 5]. Réponds uniquement avec le tableau JSON exact, sans bloc de code.",
+      "prompt_sha256": "4adab7999bf32128f775666fb146670576f2d4270ab80daf263fa619fe41192d",
+      "prompt_tokens": 53,
+      "suite": "equivalence",
+      "token_ids_sha256": "e584e76db45a90276f6f1838934f703ec1b692b2a50aaac8fabcd5261eb8959d",
+      "validator": "exact_json"
+    },
+    "E8-logique": {
+      "completion_tokens": 53,
+      "expected": [
+        "B",
+        "D"
+      ],
+      "finish_reason": "stop",
+      "max_tokens": 1024,
+      "output_sha256": "77398b4929fa51b4af0d2fdd2323676ce64af3eb8ee2a61e1ff8cff964aa0461",
+      "prompt": "Quatre étapes A, B, C, D ont les contraintes A avant C, B avant C et C avant D. Donne un ordre valide en une seule ligne et indique ensuite quelles étapes peuvent commencer immédiatement. Ta réponse doit contenir B et D.",
+      "prompt_sha256": "5dbc38ac31e1799ab7df7b61062f08962825623d353c218958a95cd3d3e91aaa",
+      "prompt_tokens": 67,
+      "suite": "equivalence",
+      "token_ids_sha256": "1116e8e15a55e4b370ac77e198a1d14bf4dc046a5211cbad5607068104599c0e",
+      "validator": "contains_all"
+    }
+  },
+  "equivalence_prompts_sha256": "0b353d9f6470ad6dbd1241cb038276b31d446f88486889b21ddf9be2759e43e4",
+  "schema": 2,
+  "source": {
+    "attestation_sha256": "79ea0e97f5dd19f864edc6c05ca94cb362d55f8af27b478a6ab9cadb173f2769",
+    "containers": {
+      "head": {
+        "container_id": "72cf103ee1f322715859c42a48984c3749d4cd0939f04dac32817fd452181eb1",
+        "exit_code": 0,
+        "image_id": "sha256:0266e5767a4fb7cba90e587c6f69ab59dea24a0cd08ea983d333295717e9bf24",
+        "name": "glm53-flash-tf",
+        "oom_killed": false,
+        "running": true
+      },
+      "worker": {
+        "container_id": "8ac1ade3a9b86be8d583e68d0c243549d12385c6a4ee79ad52b0db59279feca8",
+        "exit_code": 0,
+        "image_id": "sha256:0266e5767a4fb7cba90e587c6f69ab59dea24a0cd08ea983d333295717e9bf24",
+        "name": "glm53-flash-tf",
+        "oom_killed": false,
+        "running": true
+      }
+    },
+    "drafter": "mtp",
+    "health_after": {
+      "backend": "tensorfold",
+      "drafter": "mtp",
+      "image_id": "sha256:0266e5767a4fb7cba90e587c6f69ab59dea24a0cd08ea983d333295717e9bf24",
+      "model": null,
+      "model_ids": null,
+      "source_kind": "native-two-spark",
+      "status": "ok"
+    },
+    "health_before": {
+      "backend": "tensorfold",
+      "drafter": "mtp",
+      "image_id": "sha256:0266e5767a4fb7cba90e587c6f69ab59dea24a0cd08ea983d333295717e9bf24",
+      "model": null,
+      "model_ids": null,
+      "source_kind": "native-two-spark",
+      "status": "ok"
+    },
+    "image_id": "sha256:0266e5767a4fb7cba90e587c6f69ab59dea24a0cd08ea983d333295717e9bf24",
+    "kind": "native-two-spark",
+    "model": "GLM-5.3-Flash-EXL3",
+    "model_registry": {
+      "id": "GLM-5.3-Flash-EXL3",
+      "object": "model",
+      "owned_by": "tensorfold"
+    },
+    "recipe_commit": "4bbf2f3d83f8b5363832368021c5b56b4ced3d92",
+    "recipe_config_sha256": "35aa65773d032035787c010350a4fa32bbcd69e806d9a00fc491bfe7d9fcce07",
+    "recipe_tree": "aec352476c9958bb5f2b4fb7e767841c8e90cf20",
+    "request_drafts": false
+  }
+}

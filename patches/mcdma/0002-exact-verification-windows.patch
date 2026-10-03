@@ -1,0 +1,2569 @@
+diff --git a/benchmarks/mcdma_bw.c b/benchmarks/mcdma_bw.c
+index 8dc5282..0846f37 100644
+--- a/benchmarks/mcdma_bw.c
++++ b/benchmarks/mcdma_bw.c
+@@ -23,6 +23,7 @@
+ #include <arpa/inet.h>
+ #include <errno.h>
+ #include <inttypes.h>
++#include <math.h>
+ #include <stdarg.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -36,12 +37,13 @@
+ #include <time.h>
+ #include <unistd.h>
+
++#include "verify_windows.h"
++
+ enum { MAX_QPS=8, MAX_DEPTH=64, MIN_BYTES=4096, GUARD_BYTES=16384, FLAG_BYTES=64,
+-       WINDOW_BYTES=4096, LINE_BYTES=4096, POLL_BATCH=16 };
++       LINE_BYTES=4096, POLL_BATCH=16 };
+ #define MAX_BYTES (16u<<20)
+ #define DEFAULT_TOTAL (64ull<<20)
+ #define DEFAULT_MAX_REGION (1ull<<30)
+-#define DEFAULT_VERIFY (4ull<<20)
+
+ enum op_kind { OP_WRITE, OP_READ, OP_SEND };
+ enum finish_mode { FINISH_AUTO, FINISH_FLAG, FINISH_IMM };
+@@ -53,17 +55,16 @@ struct options {
+     enum op_kind op; enum finish_mode finish;
+     unsigned bytes, depth, qps, cq_per_qp, repeats, warmup, mtu_bytes, gid_index, timeout_s;
+     uint64_t total, max_region, verify_bytes; unsigned psn;
++    int verify_explicit;
+     int initiator; const char *device;
+     const char *payload_path, *dump_path; /* bounded, single-trial resident payload mode */
+ };
+
+ struct remote_info {
+-    uint64_t nonce, addr, length, total; unsigned depth, cqe, rd, imm_recv, psn, qps, bytes, mtu_bytes, cq_per_qp;
++    uint64_t nonce, addr, length, total, verify_requested; unsigned depth, cqe, rd, imm_recv, psn, qps, bytes, mtu_bytes, cq_per_qp, verify_explicit;
+     uint32_t rkey, qpn[MAX_QPS]; char gid[64]; char op[8]; char role[16];
+ };
+
+-struct window { uint64_t offset, length; };
+-
+ struct line_reader { char buf[LINE_BYTES]; size_t len; };
+
+ struct bench {
+@@ -78,7 +79,7 @@ struct bench {
+     struct remote_info remote;
+     int finish_imm; const char *finish_reason;
+     struct line_reader in;
+-    struct window *windows; unsigned window_count;
++    struct mcdma_verify_window *windows; unsigned window_count; uint64_t verify_effective;
+     unsigned post_retries, trials_run, trials_failed;
+     uint64_t payload_len, payload_crc;
+     /* Per-trial bookkeeping. */
+@@ -125,10 +126,18 @@ static uint64_t flag_value(uint64_t nonce,unsigned trial) {
+ static uint64_t parse_size(const char *text,int *ok) {
+     char *end=NULL; errno=0; unsigned long long v=strtoull(text,&end,10);
+     if (errno || end==text) { *ok=0; return 0; }
+-    if (!strcasecmp(end,"k")) v<<=10; else if (!strcasecmp(end,"m")) v<<=20; else if (!strcasecmp(end,"g")) v<<=30;
++    unsigned shift=0;
++    if (!strcasecmp(end,"k")) shift=10; else if (!strcasecmp(end,"m")) shift=20; else if (!strcasecmp(end,"g")) shift=30;
+     else if (*end) { *ok=0; return 0; }
++    if (shift && v>(UINT64_MAX>>shift)) { *ok=0; return 0; }
++    v<<=shift;
+     *ok=1; return v;
+ }
++static unsigned parse_unsigned_size(const char *text,int *ok) {
++    const uint64_t value=parse_size(text,ok);
++    if (*ok && value>UINT32_MAX) *ok=0;
++    return *ok ? (unsigned)value : 0;
++}
+
+ /* ---- Line protocol ------------------------------------------------------ */
+ static void msg(const char *fmt,...) __attribute__((format(printf,1,2)));
+@@ -168,6 +177,35 @@ static void expect_line(struct bench *b,const char *type,char *out,size_t size)
+     const size_t n=strlen(type);
+     if (strncmp(out,type,n) || (out[n] && out[n]!=' ')) { printf("BW_ERROR what=protocol_unexpected expected=%s got=%.200s\n",type,out); fflush(stdout); exit(2); }
+ }
++/* Pull in bytes already waiting on stdin without consuming a future record.
++ * A second terminal record can otherwise remain buffered after the final
++ * trial and incorrectly leave the process successful. */
++static void reject_buffered_type(struct bench *b,const char *type) {
++    for (;;) {
++        fd_set set; FD_ZERO(&set); FD_SET(0,&set);
++        struct timeval tv={0,0};
++        const int ready=select(1,&set,NULL,NULL,&tv);
++        if (ready<0) { if (errno==EINTR) continue; fatal("protocol_terminal_probe",errno); }
++        if (!ready) break;
++        if (b->in.len>=sizeof(b->in.buf)) fatal("protocol_line_too_long",0);
++        const ssize_t got=read(0,b->in.buf+b->in.len,sizeof(b->in.buf)-b->in.len);
++        if (got<0) { if (errno==EINTR) continue; fatal("protocol_terminal_probe",errno); }
++        if (!got) break;
++        b->in.len+=(size_t)got;
++    }
++    const size_t type_len=strlen(type); size_t start=0;
++    while (start<b->in.len) {
++        const char *base=b->in.buf+start;
++        const char *nl=memchr(base,'\n',b->in.len-start);
++        const size_t length=nl ? (size_t)(nl-base) : b->in.len-start;
++        if (length>=type_len && !memcmp(base,type,type_len) &&
++            (length==type_len || base[type_len]==' ')) {
++            printf("BW_ERROR what=protocol_duplicate_%s\n",type); fflush(stdout); exit(2);
++        }
++        if (!nl) break;
++        start+=(size_t)(nl-base)+1;
++    }
++}
+ /* Copies the value of key=value (bounded) into out; returns 0 if absent. */
+ static int field(const char *line,const char *key,char *out,size_t size) {
+     const size_t n=strlen(key);
+@@ -187,6 +225,101 @@ static uint64_t field_u64(const char *line,const char *key,uint64_t max) {
+     return v;
+ }
+
++struct trial_proof {
++    uint64_t verified, mismatches; unsigned guard_ok, ok; char receiver[16], proof[8];
++};
++
++/* COMPLETE is the receiver-proof handoff. Keep it ordered and exact so an old,
++ * extended, duplicate, or partially populated message cannot become success. */
++static struct trial_proof complete_proof(const char *line,unsigned trial,enum op_kind op,uint64_t expected) {
++    struct trial_proof p; memset(&p,0,sizeof(p));
++    uint64_t version=0, wire_trial=0, ok=0, guard_ok=0; int consumed=0;
++    const int fields=sscanf(line,
++        "COMPLETE v=%" SCNu64 " trial=%" SCNu64 " ok=%" SCNu64
++        " receiver=%15s proof=%7s verified=%" SCNu64 " mismatches=%" SCNu64
++        " guard_ok=%" SCNu64 "%n",
++        &version,&wire_trial,&ok,p.receiver,p.proof,&p.verified,&p.mismatches,&guard_ok,&consumed);
++    if (fields!=8 || consumed<=0 || line[consumed] || version!=MCDMA_BW_PROTOCOL_VERSION ||
++        wire_trial!=trial || ok>1 || guard_ok>1)
++        fatal("protocol_complete_fields",0);
++    p.ok=(unsigned)ok; p.guard_ok=(unsigned)guard_ok;
++    if (op==OP_READ) {
++        if (strcmp(p.receiver,"initiator") || strcmp(p.proof,"local") ||
++            p.verified!=expected || p.mismatches>p.verified/8 ||
++            (p.ok && (p.mismatches || !p.guard_ok)))
++            fatal("protocol_complete_receiver_proof",0);
++    } else if (strcmp(p.receiver,"responder") || strcmp(p.proof,"none") ||
++               p.verified || p.mismatches || p.guard_ok)
++        fatal("protocol_complete_nonreceiver_proof",0);
++    return p;
++}
++
++struct done_proof {
++    uint64_t verified, mismatches, errors, completions; unsigned guard_ok;
++    double seconds, cpu_pct; char receiver[16];
++};
++
++static struct done_proof done_proof(const char *line,unsigned trial,enum op_kind op,uint64_t expected) {
++    struct done_proof p; memset(&p,0,sizeof(p));
++    uint64_t version=0, wire_trial=0, guard_ok=0; int consumed=0;
++    const int fields=sscanf(line,
++        "DONE v=%" SCNu64 " trial=%" SCNu64 " seconds=%lf cpu_pct=%lf receiver=%15s"
++        " verified=%" SCNu64 " mismatches=%" SCNu64 " errors=%" SCNu64
++        " completions=%" SCNu64 " guard_ok=%" SCNu64 "%n",
++        &version,&wire_trial,&p.seconds,&p.cpu_pct,p.receiver,&p.verified,&p.mismatches,
++        &p.errors,&p.completions,&guard_ok,&consumed);
++    if (fields!=10 || consumed<=0 || line[consumed] || version!=MCDMA_BW_PROTOCOL_VERSION ||
++        wire_trial!=trial || !isfinite(p.seconds) || p.seconds<0 ||
++        !isfinite(p.cpu_pct) || p.cpu_pct<0 || guard_ok>1 ||
++        strcmp(p.receiver,op==OP_READ?"initiator":"responder") ||
++        p.verified!=expected || p.mismatches>p.verified/8)
++        fatal("protocol_done_receiver_proof",0);
++    p.guard_ok=(unsigned)guard_ok;
++    return p;
++}
++
++/* Close each trial with a two-message acknowledgement. Per-sender FIFO means
++ * a duplicated COMPLETE must precede CONFIRM and a duplicated DONE must
++ * precede CONFIRMED, so neither terminal record can hide after success. */
++static void final_control(struct bench *b,const char *expected,const char *duplicate,unsigned trial) {
++    char line[LINE_BYTES],kind[16]={0};
++    const int result=read_line(&b->in,line,sizeof(line),b->o.timeout_s);
++    if (result<=0) fatal("protocol_final_control_wait",0);
++    uint64_t version=0,wire_trial=0; int consumed=0;
++    const int fields=sscanf(line,"%15s v=%" SCNu64 " trial=%" SCNu64 "%n",
++                            kind,&version,&wire_trial,&consumed);
++    if (!strcmp(kind,duplicate)) {
++        printf("BW_ERROR what=protocol_duplicate_%s\n",duplicate); fflush(stdout); exit(2);
++    }
++    if (fields!=3 || consumed<=0 || line[consumed] || strcmp(kind,expected) ||
++        version!=MCDMA_BW_PROTOCOL_VERSION || wire_trial!=trial)
++        fatal("protocol_final_control_fields",0);
++}
++
++/* The controller closes both input pipes only after forwarding both valid
++ * final acknowledgements. Success therefore requires EOF, not an idle period:
++ * any complete or partial byte before EOF is a protocol violation. */
++static void final_eof_close(struct bench *b,unsigned trial) {
++    if (trial+1!=b->o.warmup+b->o.repeats) return;
++    if (b->in.len) fatal("protocol_trailing_control",0);
++    const double deadline=now_s()+b->o.timeout_s;
++    for (;;) {
++        double remaining=deadline-now_s();
++        if (remaining<=0) fatal("protocol_final_eof_wait",0);
++        fd_set set; FD_ZERO(&set); FD_SET(0,&set);
++        struct timeval tv; tv.tv_sec=(time_t)remaining;
++        tv.tv_usec=(suseconds_t)((remaining-(double)tv.tv_sec)*1e6);
++        const int ready=select(1,&set,NULL,NULL,&tv);
++        if (ready<0) { if (errno==EINTR) continue; fatal("protocol_final_eof_wait",errno); }
++        if (!ready) fatal("protocol_final_eof_wait",0);
++        char byte;
++        const ssize_t got=read(0,&byte,1);
++        if (got<0) { if (errno==EINTR) continue; fatal("protocol_final_eof_wait",errno); }
++        if (!got) return;
++        fatal("protocol_trailing_control",0);
++    }
++}
++
+ /* ---- Setup -------------------------------------------------------------- */
+ static void usage(void) {
+     fputs("usage: mcdma-bw --role initiator|responder --device NAME [--gid-index N]\n"
+@@ -199,7 +332,7 @@ static void usage(void) {
+ static void parse(struct bench *b,int argc,char **argv) {
+     struct options *o=&b->o;
+     o->op=OP_WRITE; o->finish=FINISH_AUTO; o->bytes=65536; o->depth=16; o->qps=1; o->repeats=3; o->warmup=1;
+-    o->mtu_bytes=1024; o->total=DEFAULT_TOTAL; o->max_region=DEFAULT_MAX_REGION; o->verify_bytes=DEFAULT_VERIFY;
++    o->mtu_bytes=1024; o->total=DEFAULT_TOTAL; o->max_region=DEFAULT_MAX_REGION;
+     o->timeout_s=30; o->psn=0x654321; o->initiator=-1;
+     for (int i=1;i<argc;++i) {
+         const char *a=argv[i];
+@@ -209,20 +342,20 @@ static void parse(struct bench *b,int argc,char **argv) {
+         const char *v=argv[++i]; int ok=1;
+         if (!strcmp(a,"--role")) { if (!strcmp(v,"initiator")) o->initiator=1; else if (!strcmp(v,"responder")) o->initiator=0; else usage(); }
+         else if (!strcmp(a,"--device")) o->device=v;
+-        else if (!strcmp(a,"--gid-index")) o->gid_index=(unsigned)parse_size(v,&ok);
++        else if (!strcmp(a,"--gid-index")) o->gid_index=parse_unsigned_size(v,&ok);
+         else if (!strcmp(a,"--op")) { if (!strcmp(v,"write")) o->op=OP_WRITE; else if (!strcmp(v,"read")) o->op=OP_READ; else if (!strcmp(v,"send")) o->op=OP_SEND; else usage(); }
+-        else if (!strcmp(a,"--bytes")) o->bytes=(unsigned)parse_size(v,&ok);
+-        else if (!strcmp(a,"--depth")) o->depth=(unsigned)parse_size(v,&ok);
+-        else if (!strcmp(a,"--qps")) o->qps=(unsigned)parse_size(v,&ok);
++        else if (!strcmp(a,"--bytes")) o->bytes=parse_unsigned_size(v,&ok);
++        else if (!strcmp(a,"--depth")) o->depth=parse_unsigned_size(v,&ok);
++        else if (!strcmp(a,"--qps")) o->qps=parse_unsigned_size(v,&ok);
+         else if (!strcmp(a,"--total")) o->total=parse_size(v,&ok);
+-        else if (!strcmp(a,"--repeats")) o->repeats=(unsigned)parse_size(v,&ok);
+-        else if (!strcmp(a,"--warmup")) o->warmup=(unsigned)parse_size(v,&ok);
+-        else if (!strcmp(a,"--mtu")) o->mtu_bytes=(unsigned)parse_size(v,&ok);
++        else if (!strcmp(a,"--repeats")) o->repeats=parse_unsigned_size(v,&ok);
++        else if (!strcmp(a,"--warmup")) o->warmup=parse_unsigned_size(v,&ok);
++        else if (!strcmp(a,"--mtu")) o->mtu_bytes=parse_unsigned_size(v,&ok);
+         else if (!strcmp(a,"--finish")) { if (!strcmp(v,"auto")) o->finish=FINISH_AUTO; else if (!strcmp(v,"flag")) o->finish=FINISH_FLAG; else if (!strcmp(v,"imm")) o->finish=FINISH_IMM; else usage(); }
+-        else if (!strcmp(a,"--verify-bytes")) o->verify_bytes=parse_size(v,&ok);
++        else if (!strcmp(a,"--verify-bytes")) { o->verify_bytes=parse_size(v,&ok); o->verify_explicit=1; }
+         else if (!strcmp(a,"--max-region")) o->max_region=parse_size(v,&ok);
+-        else if (!strcmp(a,"--timeout")) o->timeout_s=(unsigned)parse_size(v,&ok);
+-        else if (!strcmp(a,"--psn")) o->psn=(unsigned)parse_size(v,&ok);
++        else if (!strcmp(a,"--timeout")) o->timeout_s=parse_unsigned_size(v,&ok);
++        else if (!strcmp(a,"--psn")) o->psn=parse_unsigned_size(v,&ok);
+         else if (!strcmp(a,"--payload")) o->payload_path=v;
+         else if (!strcmp(a,"--dump")) o->dump_path=v;
+         else usage();
+@@ -244,6 +377,19 @@ static void parse(struct bench *b,int argc,char **argv) {
+     if (o->timeout_s<1 || o->timeout_s>3600) fatal("timeout_out_of_range",0);
+     if (o->psn>0xffffff || o->gid_index>255) fatal("psn_or_gid_index_out_of_range",0);
+     if (o->max_region<(uint64_t)o->bytes+GUARD_BYTES) fatal("max_region_too_small_for_one_request",0);
++    if (!o->payload_path && !o->dump_path) {
++        struct mcdma_verify_window *probe=NULL; size_t count=0;
++        const uint64_t slots=(uint64_t)o->qps*o->depth;
++        uint64_t effective=0;
++        enum mcdma_verify_window_error error=
++            mcdma_verify_effective_budget(o->bytes,slots,o->verify_bytes,o->verify_explicit,&effective);
++        if (error==MCDMA_VERIFY_OK)
++            error=mcdma_build_verify_windows(o->bytes,slots,effective,&probe,&count);
++        free(probe);
++        if (error!=MCDMA_VERIFY_OK || count>UINT32_MAX)
++            fatal(error!=MCDMA_VERIFY_OK ? mcdma_verify_window_error_name(error) :
++                  "verify_window_count_representation_overflow",0);
++    }
+ }
+ static enum ibv_mtu mtu_enum(unsigned bytes) { return bytes==4096 ? IBV_MTU_4096 : bytes==2048 ? IBV_MTU_2048 : IBV_MTU_1024; }
+
+@@ -266,7 +412,9 @@ static void create_queues(struct bench *b) {
+     const struct options *o=&b->o;
+     b->depth_local=o->depth;
+     /* One region: slots for every outstanding request on every QP, plus a guard. */
++    if ((uint64_t)o->qps>UINT64_MAX/o->bytes) fatal("region_slot_arithmetic_overflow",0);
+     const uint64_t slot_bytes=(uint64_t)o->qps*o->bytes;
++    if ((uint64_t)b->depth_local>(UINT64_MAX-GUARD_BYTES)/slot_bytes) fatal("region_depth_arithmetic_overflow",0);
+     if (slot_bytes*b->depth_local+GUARD_BYTES>o->max_region) {
+         unsigned fit=(unsigned)((o->max_region-GUARD_BYTES)/slot_bytes);
+         if (!fit) fatal("region_cap_below_one_slot_per_qp",0);
+@@ -367,6 +515,7 @@ static int post_recv_slot(struct bench *b,unsigned q,unsigned char *address,uint
+ static unsigned char *flag_address(struct bench *b) { return b->region+b->region_bytes-FLAG_BYTES; }
+ static uint64_t remote_flag(struct bench *b) { return b->remote.addr+b->remote.length-FLAG_BYTES; }
+
++static void build_windows_for_depth(struct bench *b,unsigned depth);
+ static void connect_queues(struct bench *b) {
+     const struct options *o=&b->o;
+     if (o->initiator) {
+@@ -376,18 +525,19 @@ static void connect_queues(struct bench *b) {
+     }
+     char qpns[MAX_QPS*12]={0};
+     for (unsigned q=0;q<o->qps;++q) { char one[12]; snprintf(one,sizeof(one),"%s%u",q?",":"",b->qp[q]->qp_num); strcat(qpns,one); }
+-    msg("ENDPOINT v=1 nonce=%" PRIu64 " role=%s op=%s bytes=%u depth=%u qps=%u cqpq=%u cqe=%u total=%" PRIu64
+-        " mtu=%u imm_recv=%u rd=%u psn=%u rkey=%u addr=%" PRIu64 " length=%" PRIu64 " gid=%s qpn=%s payload=%u",
++    msg("ENDPOINT v=%u nonce=%" PRIu64 " role=%s op=%s bytes=%u depth=%u qps=%u cqpq=%u cqe=%u total=%" PRIu64
++        " mtu=%u imm_recv=%u rd=%u psn=%u rkey=%u addr=%" PRIu64 " length=%" PRIu64 " gid=%s qpn=%s payload=%u verify_explicit=%u verify_requested=%" PRIu64,
++        MCDMA_BW_PROTOCOL_VERSION,
+         b->nonce,o->initiator?"initiator":"responder",op_names[o->op],o->bytes,b->depth_local,o->qps,o->cq_per_qp,
+         b->cqe_granted,o->total,o->mtu_bytes,b->imm_recv,b->rd_atomic,o->psn,b->mr->rkey,(uint64_t)(uintptr_t)b->region,
+-        b->region_bytes,b->gid_text,qpns,(unsigned)!!(o->payload_path || o->dump_path));
++        b->region_bytes,b->gid_text,qpns,(unsigned)!!(o->payload_path || o->dump_path),
++        (unsigned)o->verify_explicit,o->verify_bytes);
+     char line[LINE_BYTES]; expect_line(b,"ENDPOINT",line,sizeof(line));
+     char payload_mode[8];
+     const int remote_payload=field(line,"payload",payload_mode,sizeof(payload_mode)) ?
+         (int)field_u64(line,"payload",1) : 0;
+-    if (remote_payload!=!!(o->payload_path || o->dump_path)) fatal("protocol_payload_mode_mismatch",0);
+     struct remote_info *r=&b->remote;
+-    if (field_u64(line,"v",UINT64_MAX)!=1) fatal("protocol_version",0);
++    const uint64_t version=field_u64(line,"v",UINT64_MAX);
+     if (!field(line,"role",r->role,sizeof(r->role)) || !field(line,"op",r->op,sizeof(r->op)) || !field(line,"gid",r->gid,sizeof(r->gid))) fatal("protocol_endpoint_fields",0);
+     if (!strcmp(r->role,o->initiator?"initiator":"responder") || strcmp(r->op,op_names[o->op])) fatal("protocol_role_or_op_mismatch",0);
+     r->nonce=field_u64(line,"nonce",UINT64_MAX); r->bytes=(unsigned)field_u64(line,"bytes",MAX_BYTES);
+@@ -397,7 +547,13 @@ static void connect_queues(struct bench *b) {
+     r->imm_recv=(unsigned)field_u64(line,"imm_recv",1); r->rd=(unsigned)field_u64(line,"rd",255);
+     r->psn=(unsigned)field_u64(line,"psn",0xffffff); r->rkey=(uint32_t)field_u64(line,"rkey",0xffffffff);
+     r->addr=field_u64(line,"addr",UINT64_MAX); r->length=field_u64(line,"length",1ull<<40);
+-    if (r->bytes!=o->bytes || r->qps!=o->qps || r->total!=o->total || r->mtu_bytes!=o->mtu_bytes || r->cq_per_qp!=o->cq_per_qp)
++    r->verify_explicit=(unsigned)field_u64(line,"verify_explicit",1);
++    r->verify_requested=field_u64(line,"verify_requested",1ull<<40);
++    if (!mcdma_verify_protocol_matches(version,(unsigned)!!(o->payload_path || o->dump_path),(unsigned)remote_payload,
++                                       (unsigned)o->verify_explicit,r->verify_explicit,o->verify_bytes,r->verify_requested))
++        fatal(version!=MCDMA_BW_PROTOCOL_VERSION ? "protocol_version" : "protocol_verification_mode_mismatch",0);
++    if (r->bytes!=o->bytes || r->qps!=o->qps || r->total!=o->total || r->mtu_bytes!=o->mtu_bytes ||
++        r->cq_per_qp!=o->cq_per_qp)
+         fatal("protocol_configuration_mismatch",0);
+     if (!r->depth || !r->rkey || !r->length || r->addr>UINT64_MAX-r->length) fatal("protocol_endpoint_bounds",0);
+     char text[MAX_QPS*12]; if (!field(line,"qpn",text,sizeof(text))) fatal("protocol_qpn",0);
+@@ -412,6 +568,13 @@ static void connect_queues(struct bench *b) {
+     b->depth=b->depth_local<r->depth ? b->depth_local : r->depth;
+     if (r->length<(uint64_t)o->qps*o->bytes*b->depth+GUARD_BYTES) fatal("protocol_remote_region_too_small",0);
+     if (b->depth<o->depth) printf("BW_CLAMP resource=depth requested=%u granted=%u reason=agreed_with_peer\n",o->depth,b->depth);
++    /* Rebuild from the agreed resident depth, then require both peers to
++     * confirm the same effective budget before any QP enters a traffic state. */
++    build_windows_for_depth(b,b->depth);
++    msg("VERIFY bytes=%" PRIu64,b->verify_effective);
++    expect_line(b,"VERIFY",line,sizeof(line));
++    if (field_u64(line,"bytes",1ull<<40)!=b->verify_effective)
++        fatal("protocol_verify_budget_mismatch",0);
+
+     struct ibv_qp_attr attr;
+     for (unsigned q=0;q<o->qps;++q) {
+@@ -537,24 +700,24 @@ static int post_marker(struct bench *b,int imm,uint32_t imm_value,enum wr_kind k
+ }
+
+ /* ---- Verification windows --------------------------------------------- */
+-static void build_windows(struct bench *b) {
+-    const unsigned slots=b->o.qps*b->depth;
+-    b->windows=calloc((size_t)slots*3,sizeof(*b->windows)); if (!b->windows) fatal("windows_alloc",0);
+-    uint64_t budget=b->o.verify_bytes; unsigned n=0;
+-    for (unsigned s=0;s<slots && budget;++s) {
+-        const uint64_t base=(uint64_t)s*b->o.bytes;
+-        if (b->o.bytes<=3*WINDOW_BYTES) {
+-            uint64_t len=b->o.bytes<budget ? b->o.bytes : budget&~7ull; if (!len) break;
+-            b->windows[n].offset=base; b->windows[n].length=len; ++n; budget-=len; continue;
+-        }
+-        const uint64_t starts[3]={0,(b->o.bytes/2)&~7u,b->o.bytes-WINDOW_BYTES};
+-        for (unsigned w=0;w<3 && budget;++w) {
+-            uint64_t len=WINDOW_BYTES<budget ? WINDOW_BYTES : budget&~7ull; if (!len) break;
+-            b->windows[n].offset=base+starts[w]; b->windows[n].length=len; ++n; budget-=len;
+-        }
++static void build_windows_for_depth(struct bench *b,unsigned depth) {
++    free(b->windows); b->windows=NULL; b->window_count=0; b->verify_effective=0;
++    if (b->o.payload_path || b->o.dump_path) {
++        return;
+     }
+-    b->window_count=n;
++    size_t count=0;
++    const uint64_t slots=(uint64_t)b->o.qps*depth;
++    enum mcdma_verify_window_error error=
++        mcdma_verify_effective_budget(b->o.bytes,slots,b->o.verify_bytes,
++                                      b->o.verify_explicit,&b->verify_effective);
++    if (error==MCDMA_VERIFY_OK)
++        error=mcdma_build_verify_windows(b->o.bytes,slots,b->verify_effective,&b->windows,&count);
++    if (error!=MCDMA_VERIFY_OK || count>UINT32_MAX)
++        fatal(error!=MCDMA_VERIFY_OK ? mcdma_verify_window_error_name(error) :
++              "verify_window_count_representation_overflow",0);
++    b->window_count=(unsigned)count;
+ }
++static void build_windows(struct bench *b) { build_windows_for_depth(b,b->depth_local); }
+ static void poison_windows(struct bench *b) {
+     for (unsigned i=0;i<b->window_count;++i) memset(b->region+b->windows[i].offset,0xa5,(size_t)b->windows[i].length);
+ }
+@@ -670,27 +833,37 @@ static void negotiate_finish(struct bench *b) {
+ struct trial_result {
+     unsigned trial, warmup; uint64_t total_bytes, wrs, completions, errors, verified, mismatches;
+     double seconds, cpu_pct, responder_seconds, responder_cpu_pct; unsigned guard_ok, post_retries;
++    const char *verification_source, *verification_receiver;
+ };
++static uint64_t expected_verification(const struct bench *b) {
++    return b->payload_len ? b->payload_len : b->verify_effective;
++}
++static int proof_ok(const struct bench *b,const struct trial_result *t) {
++    return t->verified==expected_verification(b) && !t->mismatches && t->guard_ok;
++}
+ static void print_result(struct bench *b,const struct trial_result *t,const char *side) {
+     static int header_done;
+     const double gbit=t->seconds>0 ? (double)t->total_bytes*8/t->seconds/1e9 : 0;
+     printf("BW_RESULT side=%s trial=%u warmup=%u op=%s bytes=%u depth=%u depth_effective=%u qps=%u cq_per_qp=%u cqe=%u mtu=%u"
+            " total_bytes=%" PRIu64 " wrs=%" PRIu64 " seconds=%.6f gbit=%.4f completions=%" PRIu64 " errors=%" PRIu64 " cpu_pct=%.1f"
+-           " responder_seconds=%.6f responder_cpu_pct=%.1f verified_bytes=%" PRIu64 " mismatches=%" PRIu64 " finish=%s rd_atomic=%u"
++           " responder_seconds=%.6f responder_cpu_pct=%.1f verified_bytes=%" PRIu64 " mismatches=%" PRIu64
++           " verification_source=%s verification_receiver=%s finish=%s rd_atomic=%u"
+            " post_retries=%u guard_ok=%u measurement=%s\n",
+            side,t->trial,t->warmup,op_names[b->o.op],b->o.bytes,b->o.depth,b->depth_effective,b->o.qps,b->o.cq_per_qp,b->cqe_granted,
+            b->o.mtu_bytes,t->total_bytes,t->wrs,t->seconds,gbit,t->completions,t->errors,t->cpu_pct,t->responder_seconds,
+-           t->responder_cpu_pct,t->verified,t->mismatches,b->finish_imm?"imm":"flag",b->rd_atomic,t->post_retries,t->guard_ok,b->payload_len?"resident-payload":"pattern-bandwidth");
++           t->responder_cpu_pct,t->verified,t->mismatches,t->verification_source,t->verification_receiver,
++           b->finish_imm?"imm":"flag",b->rd_atomic,t->post_retries,t->guard_ok,b->payload_len?"resident-payload":"pattern-bandwidth");
+     if (!header_done) {
+         puts("BW_CSV_HEADER side,trial,warmup,op,bytes,depth,depth_effective,qps,cq_per_qp,cqe,mtu,total_bytes,wrs,seconds,gbit,"
+-             "completions,errors,cpu_pct,responder_seconds,responder_cpu_pct,verified_bytes,mismatches,finish,rd_atomic,post_retries,guard_ok,measurement");
++             "completions,errors,cpu_pct,responder_seconds,responder_cpu_pct,verified_bytes,mismatches,verification_source,verification_receiver,finish,rd_atomic,post_retries,guard_ok,measurement");
+         header_done=1;
+     }
+     printf("BW_CSV %s,%u,%u,%s,%u,%u,%u,%u,%u,%u,%u,%" PRIu64 ",%" PRIu64 ",%.6f,%.4f,%" PRIu64 ",%" PRIu64 ",%.1f,%.6f,%.1f,%" PRIu64
+-           ",%" PRIu64 ",%s,%u,%u,%u,%s\n",
++           ",%" PRIu64 ",%s,%s,%s,%u,%u,%u,%s\n",
+            side,t->trial,t->warmup,op_names[b->o.op],b->o.bytes,b->o.depth,b->depth_effective,b->o.qps,b->o.cq_per_qp,b->cqe_granted,
+            b->o.mtu_bytes,t->total_bytes,t->wrs,t->seconds,gbit,t->completions,t->errors,t->cpu_pct,t->responder_seconds,
+-           t->responder_cpu_pct,t->verified,t->mismatches,b->finish_imm?"imm":"flag",b->rd_atomic,t->post_retries,t->guard_ok,b->payload_len?"resident-payload":"pattern-bandwidth");
++           t->responder_cpu_pct,t->verified,t->mismatches,t->verification_source,t->verification_receiver,
++           b->finish_imm?"imm":"flag",b->rd_atomic,t->post_retries,t->guard_ok,b->payload_len?"resident-payload":"pattern-bandwidth");
+     fflush(stdout);
+ }
+ static void plan_trial(struct bench *b,uint64_t *wrs) {
+@@ -741,22 +914,35 @@ static int run_initiator_trial(struct bench *b,unsigned trial,unsigned warmup) {
+     }
+     t.seconds=now_s()-start; t.cpu_pct=t.seconds>0 ? (cpu_s()-cpu0)/t.seconds*100 : 0;
+     t.completions=s.completions; t.errors=s.errors+(failed?1:0); t.post_retries=b->post_retries-retries_before;
+-    if (b->o.op==OP_READ) { __atomic_thread_fence(__ATOMIC_SEQ_CST); t.mismatches=b->payload_len ? verify_payload(b,&t.verified) : verify_windows(b,trial,&t.verified); }
+-    t.guard_ok=guard_intact(b);
+-    msg("COMPLETE trial=%u ok=%u",trial,!failed && !t.errors && !t.mismatches && t.guard_ok);
++    if (b->o.op==OP_READ) {
++        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++        t.mismatches=b->payload_len ? verify_payload(b,&t.verified) : verify_windows(b,trial,&t.verified);
++        t.guard_ok=guard_intact(b); t.verification_source="local"; t.verification_receiver="initiator";
++    }
++    const unsigned complete_ok=(unsigned)(!failed && !t.errors && (b->o.op!=OP_READ || proof_ok(b,&t)));
++    msg("COMPLETE v=%u trial=%u ok=%u receiver=%s proof=%s verified=%" PRIu64 " mismatches=%" PRIu64 " guard_ok=%u",
++        MCDMA_BW_PROTOCOL_VERSION,trial,complete_ok,b->o.op==OP_READ?"initiator":"responder",
++        b->o.op==OP_READ?"local":"none",t.verified,t.mismatches,t.guard_ok);
+     expect_line(b,"DONE",line,sizeof(line));
+-    if (field_u64(line,"trial",UINT32_MAX)!=trial) fatal("protocol_done_trial",0);
+-    char text[64];
+-    if (field(line,"seconds",text,sizeof(text))) t.responder_seconds=atof(text);
+-    if (field(line,"cpu_pct",text,sizeof(text))) t.responder_cpu_pct=atof(text);
+-    if (b->o.op!=OP_READ) { t.verified=field_u64(line,"verified",UINT64_MAX); t.mismatches=field_u64(line,"mismatches",UINT64_MAX); }
+-    t.errors+=field_u64(line,"errors",UINT64_MAX);
+-    if (!field_u64(line,"guard_ok",1)) t.guard_ok=0;
++    const struct done_proof peer=done_proof(line,trial,b->o.op,expected_verification(b));
++    reject_buffered_type(b,"DONE");
++    msg("CONFIRM v=%u trial=%u",MCDMA_BW_PROTOCOL_VERSION,trial);
++    final_control(b,"CONFIRMED","DONE",trial);
++    final_eof_close(b,trial);
++    t.responder_seconds=peer.seconds; t.responder_cpu_pct=peer.cpu_pct;
++    if (b->o.op==OP_READ) {
++        if (peer.verified!=t.verified || peer.mismatches!=t.mismatches || peer.guard_ok!=t.guard_ok)
++            fatal("protocol_done_receiver_proof_changed",0);
++    } else {
++        t.verified=peer.verified; t.mismatches=peer.mismatches; t.guard_ok=peer.guard_ok;
++        t.verification_source="peer"; t.verification_receiver="responder";
++    }
++    t.errors+=peer.errors;
+     /* Drain any late completions so the next trial starts with an empty CQ. */
+     for (unsigned c=0;c<b->cqs;++c) { struct ibv_wc wcs[POLL_BATCH]; int n; while ((n=ibv_poll_cq(b->cq[c],POLL_BATCH,wcs))>0) for (int i=0;i<n;++i) handle_wc(b,c,&wcs[i],&s); }
+     if (b->o.dump_path && !failed && !t.errors && !t.mismatches && t.guard_ok) dump_landed(b);
+     print_result(b,&t,"initiator");
+-    return !failed && !t.errors && !t.mismatches && t.guard_ok;
++    return !failed && !t.errors && proof_ok(b,&t);
+ }
+
+ static int keep_receives_posted(struct bench *b,struct poll_stats *s) {
+@@ -826,22 +1012,37 @@ static int run_responder_trial(struct bench *b,unsigned trial,unsigned warmup) {
+     t.seconds=now_s()-start; t.cpu_pct=t.seconds>0 ? (cpu_s()-cpu0)/t.seconds*100 : 0;
+     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+     if (b->finish_imm && s.finish_seen && s.imm_value!=(uint32_t)(expected&0xffffffffu)) { ++s.errors; fputs("BW_WC imm_mismatch\n",stderr); }
+-    if (b->o.op!=OP_READ)
++    if (b->o.op!=OP_READ) {
+         t.mismatches=b->payload_len ? verify_payload(b,&t.verified) : verify_windows(b,trial,&t.verified);
++        t.verification_source="local"; t.verification_receiver="responder";
++    }
+     if (!have_complete) expect_line(b,"COMPLETE",line,sizeof(line));
+-    if (field_u64(line,"trial",UINT32_MAX)!=trial) fatal("protocol_complete_trial",0);
+-    if (!field_u64(line,"ok",1)) ++s.errors;
++    const struct trial_proof peer=complete_proof(line,trial,b->o.op,expected_verification(b));
++    reject_buffered_type(b,"COMPLETE");
++    if (!peer.ok) ++s.errors;
+     t.completions=s.completions; t.errors=s.errors+(failed?1:0); t.post_retries=b->post_retries-retries_before;
+-    t.guard_ok=guard_intact(b); t.responder_seconds=t.seconds; t.responder_cpu_pct=t.cpu_pct;
++    const unsigned local_guard=(unsigned)guard_intact(b);
++    if (b->o.op==OP_READ) {
++        t.verified=peer.verified; t.mismatches=peer.mismatches; t.guard_ok=peer.guard_ok;
++        t.verification_source="peer"; t.verification_receiver="initiator";
++        if (!local_guard) ++t.errors;
++    } else t.guard_ok=local_guard;
++    t.responder_seconds=t.seconds; t.responder_cpu_pct=t.cpu_pct;
+     if (b->o.dump_path && !failed && !t.errors && !t.mismatches && t.guard_ok) dump_landed(b);
+-    msg("DONE trial=%u seconds=%.6f cpu_pct=%.1f verified=%" PRIu64 " mismatches=%" PRIu64 " errors=%" PRIu64 " completions=%" PRIu64 " guard_ok=%u",
+-        trial,t.seconds,t.cpu_pct,t.verified,t.mismatches,t.errors,t.completions,t.guard_ok);
++    msg("DONE v=%u trial=%u seconds=%.6f cpu_pct=%.1f receiver=%s verified=%" PRIu64
++        " mismatches=%" PRIu64 " errors=%" PRIu64 " completions=%" PRIu64 " guard_ok=%u",
++        MCDMA_BW_PROTOCOL_VERSION,trial,t.seconds,t.cpu_pct,t.verification_receiver,t.verified,
++        t.mismatches,t.errors,t.completions,t.guard_ok);
++    final_control(b,"CONFIRM","COMPLETE",trial);
++    msg("CONFIRMED v=%u trial=%u",MCDMA_BW_PROTOCOL_VERSION,trial);
++    final_eof_close(b,trial);
+     print_result(b,&t,"responder");
+-    return !failed && !t.errors && !t.mismatches && t.guard_ok;
++    return !failed && !t.errors && proof_ok(b,&t);
+ }
+
+ static int release(struct bench *b) {
+     int error=0;
++    free(b->windows); b->windows=NULL; b->window_count=0;
+     for (unsigned q=0;q<b->o.qps;++q) if (b->qp[q] && !error) error=ibv_destroy_qp(b->qp[q]);
+     for (unsigned c=0;c<b->cqs;++c) if (b->cq[c] && !error) error=ibv_destroy_cq(b->cq[c]);
+     if (!error && b->mr) error=ibv_dereg_mr(b->mr);
+@@ -856,9 +1057,10 @@ int main(int argc,char **argv) {
+     static struct bench b;
+     parse(&b,argc,argv);
+     printf("BW_CONFIG role=%s op=%s bytes=%u depth=%u qps=%u cq_per_qp=%u total=%" PRIu64 " repeats=%u warmup=%u mtu=%u finish=%s"
+-           " verify_bytes=%" PRIu64 " max_region=%" PRIu64 " platform=%s\n",
++           " verify_requested=%" PRIu64 " verify_mode=%s max_region=%" PRIu64 " platform=%s\n",
+            b.o.initiator?"initiator":"responder",op_names[b.o.op],b.o.bytes,b.o.depth,b.o.qps,b.o.cq_per_qp,b.o.total,b.o.repeats,
+-           b.o.warmup,b.o.mtu_bytes,b.o.finish==FINISH_AUTO?"auto":b.o.finish==FINISH_FLAG?"flag":"imm",b.o.verify_bytes,b.o.max_region,
++           b.o.warmup,b.o.mtu_bytes,b.o.finish==FINISH_AUTO?"auto":b.o.finish==FINISH_FLAG?"flag":"imm",b.o.verify_bytes,
++           b.o.payload_path||b.o.dump_path?"full-crc":b.o.verify_explicit?"explicit":"auto",b.o.max_region,
+ #ifdef __APPLE__
+            "darwin"
+ #else
+@@ -867,13 +1069,17 @@ int main(int argc,char **argv) {
+            );
+     open_device(&b);
+     create_queues(&b);
+-    connect_queues(&b);
+     build_windows(&b);
++    connect_queues(&b);
+     b.depth_effective=b.depth; /* Agreed with the peer; both ends advertised their own bound. */
++    printf("BW_VERIFY agreed=1 mode=%s requested=%" PRIu64 " effective=%" PRIu64 " windows=%u depth=%u\n",
++           b.o.payload_path||b.o.dump_path?"full-crc":b.o.verify_explicit?"explicit":"auto",
++           b.o.verify_bytes,b.verify_effective,b.window_count,b.depth);
+     negotiate_finish(&b);
+     prepare_payload(&b);
+-    printf("BW_SETUP depth=%u depth_effective=%u cqs=%u cqe=%u qp_wr=%u rd_atomic=%u dest_rd=%u region_bytes=%" PRIu64 " windows=%u finish=%s\n",
+-           b.depth,b.depth_effective,b.cqs,b.cqe_granted,b.qp_wr,b.rd_atomic,b.dest_rd,b.region_bytes,b.window_count,b.finish_imm?"imm":"flag");
++    printf("BW_SETUP depth=%u depth_effective=%u cqs=%u cqe=%u qp_wr=%u rd_atomic=%u dest_rd=%u region_bytes=%" PRIu64 " verify_bytes=%" PRIu64 " windows=%u finish=%s\n",
++           b.depth,b.depth_effective,b.cqs,b.cqe_granted,b.qp_wr,b.rd_atomic,b.dest_rd,b.region_bytes,
++           b.verify_effective,b.window_count,b.finish_imm?"imm":"flag");
+     fflush(stdout);
+     const unsigned trials=b.o.warmup+b.o.repeats;
+     for (unsigned trial=0;trial<trials;++trial) {
+diff --git a/benchmarks/run_bw.py b/benchmarks/run_bw.py
+index 3e5d2e9..55cada3 100644
+--- a/benchmarks/run_bw.py
++++ b/benchmarks/run_bw.py
+@@ -34,6 +34,21 @@ SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8']
+ OPS = ('write', 'read', 'send')
+ INITIATORS = ('mac', 'peer')
+ CSV_PREFIX = ['initiator', 'round', 'mode_confirmed']
++BW_PROTOCOL_VERSION = 3
++GUARD_BYTES = 16384
++MAX_BYTES = 16 << 20
++MAX_DEPTH = 64
++MAX_QPS = 8
++MAX_TOTAL = 1 << 40
++AUTO_VERIFY_BYTES = 1 << 20
++ENDPOINT_FIELDS = ('v', 'nonce', 'role', 'op', 'bytes', 'depth', 'qps', 'cqpq', 'cqe', 'total', 'mtu',
++                   'imm_recv', 'rd', 'psn', 'rkey', 'addr', 'length', 'gid', 'qpn', 'payload',
++                   'verify_explicit', 'verify_requested')
++RESULT_FIELDS = ('side', 'trial', 'warmup', 'op', 'bytes', 'depth', 'depth_effective', 'qps',
++                 'cq_per_qp', 'cqe', 'mtu', 'total_bytes', 'wrs', 'seconds', 'gbit', 'completions',
++                 'errors', 'cpu_pct', 'responder_seconds', 'responder_cpu_pct', 'verified_bytes',
++                 'mismatches', 'verification_source', 'verification_receiver', 'finish', 'rd_atomic',
++                 'post_retries', 'guard_ok', 'measurement')
+
+
+ class CleanupSignals:
+@@ -99,7 +114,9 @@ def program_arguments(config, role, device, gid_index, args):
+             '--op', config['op'], '--bytes', str(config['bytes']), '--depth', str(config['depth']),
+             '--qps', str(config['qps']), '--total', str(args.total), '--repeats', '1',
+             '--warmup', str(args.warmup), '--mtu', str(args.mtu), '--finish', args.finish,
+-            '--timeout', str(args.timeout), '--verify-bytes', str(args.verify_bytes)]
++            '--timeout', str(args.timeout)]
++    if args.verify_bytes is not None:
++        argv += ['--verify-bytes', str(args.verify_bytes)]
+     if config['cq_per_qp']:
+         argv.append('--cq-per-qp')
+     if getattr(args, 'payload', None):
+@@ -125,32 +142,56 @@ def ssh_line(host, command):
+     return shlex.join(SSH + [host, shlex.join(command)])
+
+
+-def descriptor(payload):
+-    """Validate an ENDPOINT payload; returns (fields, mac_address)."""
++def protocol_fields(payload, message, required):
++    """Parse one exact key=value protocol message, rejecting extensions."""
+     words = payload.split()
+-    if not words or words[0] != 'ENDPOINT':
+-        raise ValueError('Missing bandwidth endpoint')
++    if not words or words[0] != message:
++        raise ValueError(f'Missing bandwidth {message.lower()}')
+     fields = {}
+     for word in words[1:]:
+         key, sep, value = word.partition('=')
+         if not sep or not re.fullmatch(r'[a-z_]+', key) or key in fields:
+-            raise ValueError('Malformed endpoint field')
++            raise ValueError(f'Malformed {message.lower()} field')
+         fields[key] = value
+-    required = ['v', 'nonce', 'role', 'op', 'bytes', 'depth', 'qps', 'cqpq', 'cqe', 'total', 'mtu',
+-                'imm_recv', 'rd', 'psn', 'rkey', 'addr', 'length', 'gid', 'qpn']
+-    if any(key not in fields for key in required):
+-        raise ValueError('Incomplete endpoint')
+-    numbers = {key: fields[key] for key in required if key not in ('role', 'op', 'gid', 'qpn')}
++    if set(fields) != set(required):
++        missing = sorted(set(required) - set(fields))
++        unexpected = sorted(set(fields) - set(required))
++        raise ValueError(f'Incomplete or unexpected {message.lower()} fields: missing={missing} unexpected={unexpected}')
++    return fields
++
++
++def descriptor(payload):
++    """Validate one complete v3 ENDPOINT; returns (fields, MAC address)."""
++    fields = protocol_fields(payload, 'ENDPOINT', ENDPOINT_FIELDS)
++    numbers = {key: fields[key] for key in ENDPOINT_FIELDS if key not in ('role', 'op', 'gid', 'qpn')}
+     if any(not re.fullmatch(r'[0-9]+', value) for value in numbers.values()):
+         raise ValueError('Non-numeric endpoint field')
+     numbers = {key: int(value) for key, value in numbers.items()}
+     qpns = fields['qpn'].split(',')
+-    if (numbers['v'] != 1 or fields['role'] not in ('initiator', 'responder') or fields['op'] not in OPS or
+-            not 0 < numbers['rkey'] <= 0xffffffff or not 0 < numbers['length'] <= 1 << 40 or
+-            not 0 < numbers['addr'] <= (1 << 64) - numbers['length'] or not 1 <= numbers['qps'] <= 8 or
+-            len(qpns) != numbers['qps'] or numbers['psn'] > 0xffffff or
++    if (numbers['v'] != BW_PROTOCOL_VERSION or fields['role'] not in ('initiator', 'responder') or
++            fields['op'] not in OPS or not 4096 <= numbers['bytes'] <= MAX_BYTES or numbers['bytes'] % 8 or
++            not 1 <= numbers['depth'] <= MAX_DEPTH or not 1 <= numbers['qps'] <= MAX_QPS or
++            numbers['cqpq'] not in (0, 1) or not 1 <= numbers['cqe'] <= 1 << 20 or
++            not numbers['bytes'] <= numbers['total'] <= MAX_TOTAL or numbers['mtu'] not in (1024, 2048, 4096) or
++            numbers['imm_recv'] not in (0, 1) or not 1 <= numbers['rd'] <= numbers['depth'] or
++            numbers['psn'] > 0xffffff or not 0 < numbers['rkey'] <= 0xffffffff or
++            numbers['payload'] not in (0, 1) or numbers['verify_explicit'] not in (0, 1) or
++            numbers['nonce'] > 0xffffffffffffffff or
++            not 0 < numbers['addr'] <= (1 << 64) - numbers['length'] or
++            numbers['length'] != numbers['bytes'] * numbers['depth'] * numbers['qps'] + GUARD_BYTES or
++            len(qpns) != numbers['qps'] or
+             any(not re.fullmatch(r'[0-9]+', q) or not 0 < int(q) <= 0xffffff for q in qpns)):
+         raise ValueError('Invalid endpoint bounds')
++    capacity = numbers['bytes'] * numbers['depth'] * numbers['qps']
++    if numbers['payload']:
++        valid_verify = numbers['verify_explicit'] == 0 and numbers['verify_requested'] == 0
++    elif numbers['verify_explicit']:
++        valid_verify = (24 <= numbers['verify_requested'] <= capacity and
++                        numbers['verify_requested'] % 8 == 0)
++    else:
++        valid_verify = numbers['verify_requested'] == 0 and capacity >= 24
++    if not valid_verify:
++        raise ValueError('Invalid endpoint verification contract')
+     gid = ipaddress.IPv6Address(fields['gid'])
+     raw = gid.packed
+     if not gid.is_link_local or raw[11:13] != b'\xff\xfe':
+@@ -159,6 +200,40 @@ def descriptor(payload):
+     return fields, mac
+
+
++def endpoint_pair(held):
++    """Validate both roles and return the one effective v3 verification budget."""
++    if len(held) != 2:
++        raise ValueError('Exactly two endpoints are required')
++    parsed = {endpoint: descriptor(payload)[0] for endpoint, payload in held.items()}
++    by_role = {fields['role']: fields for fields in parsed.values()}
++    if set(by_role) != {'initiator', 'responder'}:
++        raise ValueError('Endpoints must contain one initiator and one responder')
++    initiator, responder = by_role['initiator'], by_role['responder']
++    matching = ('op', 'bytes', 'qps', 'cqpq', 'total', 'mtu', 'psn', 'payload',
++                'verify_explicit', 'verify_requested')
++    if any(initiator[key] != responder[key] for key in matching):
++        raise ValueError('Endpoint configuration mismatch')
++    if int(initiator['nonce']) == 0 or int(responder['nonce']) != 0:
++        raise ValueError('Endpoint nonce/role mismatch')
++    capacity = int(initiator['bytes']) * int(initiator['qps']) * min(
++        int(initiator['depth']), int(responder['depth']))
++    if int(initiator['payload']):
++        return 0
++    requested = int(initiator['verify_requested'])
++    effective = requested if int(initiator['verify_explicit']) else min(AUTO_VERIFY_BYTES, capacity)
++    if effective < 24 or effective > capacity or effective % 8:
++        raise ValueError('Agreed verification budget is invalid')
++    return effective
++
++
++def verification(payload):
++    """Parse the exact v3 VERIFY message."""
++    fields = protocol_fields(payload, 'VERIFY', ('bytes',))
++    if not re.fullmatch(r'[0-9]+', fields['bytes']):
++        raise ValueError('Non-numeric verify budget')
++    return int(fields['bytes'])
++
++
+ def mac_mode_markers(stderr, cq_map, user_post, user_bf, cqs, qps):
+     """Confirm the provider ran the requested Mac mode for every CQ and QP.
+     Raises ValueError when a mode was requested but not uniquely confirmed."""
+@@ -199,77 +274,344 @@ def mac_mode_markers(stderr, cq_map, user_post, user_bf, cqs, qps):
+ class Relay:
+     """Drives one benchmark pair: forwards BW_MSG payloads, collects rows."""
+
+-    def __init__(self, endpoints, log, deadline, on_endpoints):
++    def __init__(self, endpoints, log, deadline, on_endpoints, expected_warmup, expected_repeats):
++        if expected_warmup < 0 or expected_repeats < 1:
++            raise ValueError('Invalid planned trial contract')
+         self.endpoints, self.log, self.deadline, self.on_endpoints = endpoints, log, deadline, on_endpoints
++        self.expected_warmup = expected_warmup
++        self.expected_trials = expected_warmup + expected_repeats
++        self.expected_row_keys = {(trial, int(trial < expected_warmup))
++                                  for trial in range(self.expected_trials)}
+         self.header = None
+         self.rows = {endpoint: [] for endpoint in endpoints}
+         self.errors = []
+         self.done = set()
+         self.exited = set()
+         self.held = {}
++        self.verify_held = {}
++        self.verify_expected = None
++        self.verify_complete = False
+         self.results = []
++        self.result_endpoints = set()
++        self.headers = set()
++        self.endpoint_fields = {}
++        self.payload_bytes = {}
++        self.proof_results = {endpoint: {} for endpoint in endpoints}
++        self.proof_csv = {endpoint: {} for endpoint in endpoints}
++        self.done_trials = {}
++        self.final_acks = {}
++        self.closed_inputs = set()
++        self.input_close_errors = []
++        self.inputs_closed = False
+
+     def other(self, endpoint):
+         return self.endpoints[1] if endpoint is self.endpoints[0] else self.endpoints[0]
+
++    def row_key(self, fields):
++        if not re.fullmatch(r'[0-9]+', fields['trial']) or fields['warmup'] not in ('0', '1'):
++            raise ValueError('Invalid receiver-proof trial identity')
++        key = int(fields['trial']), int(fields['warmup'])
++        if key not in self.expected_row_keys:
++            raise ValueError('Receiver-proof row contradicts planned trial or warmup')
++        return key
++
++    def final_ack(self, endpoint, payload):
++        message = payload.split(' ', 1)[0]
++        fields = protocol_fields(payload, message, ('v', 'trial'))
++        if (fields['v'] != str(BW_PROTOCOL_VERSION) or
++                not re.fullmatch(r'[0-9]+', fields['trial'])):
++            raise ValueError(f'{endpoint.host}: malformed final acknowledgement')
++        trial = int(fields['trial'])
++        if not 0 <= trial < self.expected_trials:
++            raise ValueError(f'{endpoint.host}: final acknowledgement trial is unplanned')
++        role = self.endpoint_fields[endpoint]['role']
++        expected_message = 'CONFIRM' if role == 'initiator' else 'CONFIRMED'
++        if message != expected_message:
++            raise ValueError(f'{endpoint.host}: final acknowledgement came from the wrong role')
++        for prior in range(trial):
++            if self.final_acks.get(prior) != {'CONFIRM', 'CONFIRMED'}:
++                raise ValueError(f'{endpoint.host}: final acknowledgement skipped a trial')
++        state = self.final_acks.setdefault(trial, set())
++        if message in state or (message == 'CONFIRMED' and 'CONFIRM' not in state):
++            raise ValueError(f'{endpoint.host}: duplicate or out-of-order final acknowledgement')
++        state.add(message)
++        return trial == self.expected_trials - 1 and message == 'CONFIRMED'
++
++    def close_input(self, endpoint):
++        if endpoint in self.closed_inputs:
++            return
++        stream = endpoint.process.stdin
++        try:
++            stream.close()
++        except (OSError, ValueError) as error:
++            raise RuntimeError(f'{endpoint.host}: failed to close endpoint input: {error}') from error
++        if not stream.closed:
++            raise RuntimeError(f'{endpoint.host}: endpoint input remained open after close')
++        self.closed_inputs.add(endpoint)
++
++    def close_inputs(self):
++        if self.inputs_closed:
++            return
++        for endpoint in self.endpoints:
++            self.close_input(endpoint)
++        if self.closed_inputs != set(self.endpoints):
++            raise RuntimeError('Not every endpoint input closed')
++        self.inputs_closed = True
++
++    def best_effort_close_inputs(self):
++        for endpoint in self.endpoints:
++            if endpoint in self.closed_inputs:
++                continue
++            try:
++                self.close_input(endpoint)
++            except RuntimeError as error:
++                text = str(error)
++                if text not in self.input_close_errors:
++                    self.input_close_errors.append(text)
++                    self.log.append({'host': endpoint.host, 'input_close_error': text})
++
++    def expected_proof_bytes(self):
++        if self.verify_expected:
++            return self.verify_expected
++        expected = set(self.endpoints)
++        if (set(self.payload_bytes) != expected or len(set(self.payload_bytes.values())) != 1 or
++                next(iter(self.payload_bytes.values())) <= 0):
++            raise ValueError('Missing or contradictory resident-payload proof size')
++        return next(iter(self.payload_bytes.values()))
++
++    def validate_proof_row(self, endpoint, fields):
++        descriptor_fields = self.endpoint_fields.get(endpoint)
++        if descriptor_fields is None:
++            raise ValueError('Receiver-proof row preceded endpoint negotiation')
++        numeric = ('bytes', 'depth', 'depth_effective', 'qps', 'cq_per_qp', 'cqe', 'mtu',
++                   'total_bytes', 'wrs', 'completions', 'errors', 'verified_bytes', 'mismatches',
++                   'rd_atomic', 'post_retries', 'guard_ok')
++        if any(not re.fullmatch(r'[0-9]+', fields[key]) for key in numeric):
++            raise ValueError(f'{endpoint.host}: non-numeric receiver-proof row')
++        expected_role = descriptor_fields['role']
++        expected_op = descriptor_fields['op']
++        receiver = 'initiator' if expected_op == 'read' else 'responder'
++        source = 'local' if expected_role == receiver else 'peer'
++        expected_shape = {
++            'side': expected_role, 'op': expected_op, 'bytes': descriptor_fields['bytes'],
++            'depth': descriptor_fields['depth'], 'qps': descriptor_fields['qps'],
++            'cq_per_qp': descriptor_fields['cqpq'], 'cqe': descriptor_fields['cqe'],
++            'mtu': descriptor_fields['mtu'], 'verification_source': source,
++            'verification_receiver': receiver,
++            'measurement': 'resident-payload' if descriptor_fields['payload'] == '1' else 'pattern-bandwidth',
++        }
++        if any(fields[key] != value for key, value in expected_shape.items()):
++            raise ValueError(f'{endpoint.host}: receiver-proof role, direction, or shape mismatch')
++        expected_depth = min(int(item['depth']) for item in self.endpoint_fields.values())
++        if (int(fields['depth_effective']) != expected_depth or
++                int(fields['verified_bytes']) != self.expected_proof_bytes() or
++                int(fields['mismatches']) != 0 or int(fields['errors']) != 0 or
++                int(fields['guard_ok']) != 1):
++            raise ValueError(f'{endpoint.host}: invalid receiver-proof success row')
++        key = self.row_key(fields)
++        if self.final_acks.get(key[0]) != {'CONFIRM', 'CONFIRMED'}:
++            raise ValueError(f'{endpoint.host}: receiver-proof row preceded its final acknowledgement')
++        if key[0] == self.expected_trials - 1 and not self.inputs_closed:
++            raise ValueError(f'{endpoint.host}: receiver-proof row preceded the final EOF gate')
++        return key
++
++    def validate_proof_pairs(self):
++        expected = set(self.endpoints)
++        if set(self.proof_results) != expected or set(self.proof_csv) != expected:
++            raise ValueError('Missing receiver-proof endpoint rows')
++        for endpoint in self.endpoints:
++            if (not self.proof_results[endpoint] or
++                    set(self.proof_results[endpoint]) != set(self.proof_csv[endpoint])):
++                raise ValueError(f'{endpoint.host}: result and CSV receiver-proof rows disagree')
++            for key, result in self.proof_results[endpoint].items():
++                if result != self.proof_csv[endpoint][key]:
++                    raise ValueError(f'{endpoint.host}: result and CSV receiver-proof fields disagree')
++            trials = self.done_trials.get(endpoint)
++            if (trials != self.expected_trials or
++                    set(self.proof_results[endpoint]) != self.expected_row_keys):
++                raise ValueError(f'{endpoint.host}: receiver-proof trial count or sequence mismatch')
++        first, second = self.endpoints
++        if set(self.proof_results[first]) != set(self.proof_results[second]):
++            raise ValueError('Endpoint receiver-proof trial identities disagree')
++        for key in self.proof_results[first]:
++            left, right = self.proof_results[first][key], self.proof_results[second][key]
++            common = ('trial', 'warmup', 'op', 'bytes', 'depth_effective', 'qps', 'cq_per_qp', 'mtu',
++                      'total_bytes', 'wrs', 'verified_bytes', 'mismatches', 'verification_receiver',
++                      'guard_ok', 'measurement')
++            if any(left[field] != right[field] for field in common):
++                raise ValueError('Endpoint receiver-proof rows contradict each other')
++            if {left['side'], right['side']} != {'initiator', 'responder'} or \
++                    {left['verification_source'], right['verification_source']} != {'local', 'peer'}:
++                raise ValueError('Receiver-proof rows do not identify one receiver and one peer')
++
+     def handle(self, endpoint, text):
+         self.log.append({'host': endpoint.host, 'response': text})
++        if endpoint in self.done:
++            raise ValueError(f'{endpoint.host}: output followed BW_DONE')
+         if text.startswith('BW_MSG '):
+             payload = text[len('BW_MSG '):]
+             if payload.startswith('ENDPOINT '):
++                if endpoint in self.held or self.verify_expected is not None:
++                    raise ValueError('Duplicate or late endpoint')
+                 self.held[endpoint] = payload
+                 if len(self.held) == 2:
++                    self.verify_expected = endpoint_pair(self.held)
++                    self.endpoint_fields = {source: descriptor(held)[0] for source, held in self.held.items()}
+                     self.on_endpoints(self.held)
+                     for source, held in list(self.held.items()):
+                         self.other(source).send(held)
+                 return
++            if payload.startswith('VERIFY '):
++                if self.verify_expected is None or endpoint in self.verify_held:
++                    raise ValueError('Early or duplicate verification budget')
++                self.verify_held[endpoint] = payload
++                if len(self.verify_held) == 2:
++                    values = [verification(item) for item in self.verify_held.values()]
++                    if values != [self.verify_expected, self.verify_expected]:
++                        raise ValueError('Verification budget mismatch')
++                    for source, held in list(self.verify_held.items()):
++                        self.other(source).send(held)
++                    self.verify_complete = True
++                return
++            if not self.verify_complete:
++                raise ValueError('Protocol message preceded verified v3 negotiation')
++            if self.inputs_closed:
++                raise ValueError('Protocol message followed the final input close')
++            close_after_forward = payload.startswith(('CONFIRM ', 'CONFIRMED ')) and self.final_ack(endpoint, payload)
+             self.other(endpoint).send(payload)
++            if close_after_forward:
++                self.close_inputs()
+         elif text.startswith('BW_CSV_HEADER '):
++            if not self.verify_complete:
++                raise ValueError('Premature CSV header preceded verified v3 negotiation')
++            if endpoint in self.headers:
++                raise ValueError(f'{endpoint.host}: duplicate CSV header')
+             header = text[len('BW_CSV_HEADER '):]
+-            if self.header not in (None, header):
++            if header != ','.join(RESULT_FIELDS) or self.header not in (None, header):
+                 raise RuntimeError('Endpoints disagree on the CSV header')
+             self.header = header
++            self.headers.add(endpoint)
+         elif text.startswith('BW_CSV '):
+-            self.rows[endpoint].append(text[len('BW_CSV '):])
+-        elif text.startswith(('BW_RESULT ','BW_CLAMP ','BW_FINISH ','BW_PAYLOAD ','BW_DUMP ')):
++            if not self.verify_complete:
++                raise ValueError('Premature CSV row preceded verified v3 negotiation')
++            if endpoint not in self.headers:
++                raise ValueError(f'{endpoint.host}: CSV row preceded its header')
++            row = text[len('BW_CSV '):]
++            if not row:
++                raise ValueError(f'{endpoint.host}: empty CSV row')
++            values = row.split(',')
++            if len(values) != len(RESULT_FIELDS):
++                raise ValueError(f'{endpoint.host}: malformed receiver-proof CSV row')
++            fields = dict(zip(RESULT_FIELDS, values))
++            key = self.validate_proof_row(endpoint, fields)
++            if key in self.proof_csv[endpoint]:
++                raise ValueError(f'{endpoint.host}: duplicate receiver-proof CSV row')
++            self.proof_csv[endpoint][key] = fields
++            self.rows[endpoint].append(row)
++        elif text.startswith('BW_PAYLOAD '):
++            if not self.verify_complete:
++                raise ValueError('Premature benchmark output preceded verified v3 negotiation')
++            fields = protocol_fields(text, 'BW_PAYLOAD', ('bytes', 'crc64', 'capacity', 'mode'))
++            if (endpoint in self.payload_bytes or not re.fullmatch(r'[0-9]+', fields['bytes']) or
++                    int(fields['bytes']) <= 0 or fields['mode'] != 'resident_single_trial'):
++                raise ValueError(f'{endpoint.host}: malformed or duplicate resident-payload contract')
++            self.payload_bytes[endpoint] = int(fields['bytes'])
++            self.results.append(f'{endpoint.host}: {text}')
++            print(f'{endpoint.host}: {text}', flush=True)
++        elif text.startswith(('BW_VERIFY ', 'BW_SETUP ', 'BW_FINISH ', 'BW_DUMP ')):
++            if not self.verify_complete:
++                raise ValueError('Premature benchmark output preceded verified v3 negotiation')
++            self.results.append(f'{endpoint.host}: {text}')
++            print(f'{endpoint.host}: {text}', flush=True)
++        elif text.startswith('BW_RESULT '):
++            if not self.verify_complete:
++                raise ValueError('Premature result preceded verified v3 negotiation')
++            fields = protocol_fields(text, 'BW_RESULT', RESULT_FIELDS)
++            key = self.validate_proof_row(endpoint, fields)
++            if key in self.proof_results[endpoint]:
++                raise ValueError(f'{endpoint.host}: duplicate receiver-proof result row')
++            self.proof_results[endpoint][key] = fields
++            self.results.append(f'{endpoint.host}: {text}')
++            self.result_endpoints.add(endpoint)
++            print(f'{endpoint.host}: {text}', flush=True)
++        elif text.startswith(('BW_CONFIG ', 'BW_CLAMP ')):
+             self.results.append(f'{endpoint.host}: {text}')
+             print(f'{endpoint.host}: {text}', flush=True)
+         elif text.startswith('BW_ERROR '):
+             self.errors.append(f'{endpoint.host}: {text}')
+             print(f'{endpoint.host}: {text}', flush=True)
+         elif text.startswith('BW_DONE '):
++            if not self.verify_complete:
++                raise ValueError('Premature BW_DONE preceded verified v3 negotiation')
++            if not self.inputs_closed:
++                raise ValueError(f'{endpoint.host}: BW_DONE preceded the final EOF gate')
++            fields = protocol_fields(text, 'BW_DONE', ('trials', 'failed', 'cleanup'))
++            if (any(not re.fullmatch(r'[0-9]+', value) for value in fields.values()) or
++                    int(fields['trials']) != self.expected_trials or int(fields['failed']) != 0 or
++                    int(fields['cleanup']) != 0):
++                raise ValueError(f'{endpoint.host}: unsuccessful or malformed BW_DONE')
+             self.done.add(endpoint)
++            self.done_trials[endpoint] = int(fields['trials'])
+             print(f'{endpoint.host}: {text}', flush=True)
++        elif text:
++            raise ValueError(f'{endpoint.host}: unexpected benchmark output')
+
+     def run(self):
+-        with selectors.DefaultSelector() as selector:
+-            for endpoint in self.endpoints:
+-                selector.register(endpoint.process.stdout, selectors.EVENT_READ, endpoint)
+-            while len(self.done | self.exited) < 2:
+-                remaining = self.deadline - time.monotonic()
+-                if remaining <= 0:
+-                    raise RuntimeError('benchmark pair timeout')
+-                for key, _ in selector.select(min(remaining, 1.0)):
+-                    endpoint = key.data
+-                    data = os.read(endpoint.process.stdout.fileno(), 65536)
+-                    if not data:
+-                        selector.unregister(endpoint.process.stdout)
+-                        self.exited.add(endpoint)
+-                        continue
+-                    endpoint.pending += data
+-                    if len(endpoint.pending) > 1 << 20:
+-                        raise RuntimeError('Endpoint output exceeds protocol limit')
+-                    while b'\n' in endpoint.pending:
+-                        line, endpoint.pending = endpoint.pending.split(b'\n', 1)
+-                        self.handle(endpoint, line.decode(errors='replace').strip())
+-                if self.errors and len(self.done | self.exited) < 2:
+-                    # A failed side cannot recover; let the other see EOF.
+-                    for endpoint in self.endpoints:
+-                        if endpoint not in self.exited:
++        error_inputs_closed = False
++        try:
++            with selectors.DefaultSelector() as selector:
++                for endpoint in self.endpoints:
++                    selector.register(endpoint.process.stdout, selectors.EVENT_READ, endpoint)
++                # A successful DONE is not terminal until stdout reaches EOF. Keep
++                # draining both children so duplicate/trailing protocol output in
++                # a later pipe read cannot escape validation.
++                while len(self.exited) < 2:
++                    remaining = self.deadline - time.monotonic()
++                    if remaining <= 0:
++                        raise RuntimeError('benchmark pair timeout')
++                    for key, _ in selector.select(min(remaining, 1.0)):
++                        endpoint = key.data
++                        data = os.read(endpoint.process.stdout.fileno(), 65536)
++                        if not data:
++                            if endpoint.pending:
++                                raise ValueError(f'{endpoint.host}: truncated endpoint output at EOF')
++                            selector.unregister(endpoint.process.stdout)
++                            self.exited.add(endpoint)
++                            continue
++                        endpoint.pending += data
++                        if len(endpoint.pending) > 1 << 20:
++                            raise RuntimeError('Endpoint output exceeds protocol limit')
++                        while b'\n' in endpoint.pending:
++                            line, endpoint.pending = endpoint.pending.split(b'\n', 1)
+                             try:
+-                                endpoint.process.stdin.close()
+-                            except (OSError, ValueError):
+-                                pass
++                                text = line.decode('ascii')
++                            except UnicodeDecodeError as error:
++                                raise ValueError(f'{endpoint.host}: endpoint output is not ASCII protocol text') from error
++                            self.handle(endpoint, text.strip())
++                    if self.errors and not error_inputs_closed and len(self.exited) < 2:
++                        # A failed side cannot recover; let the other see EOF.
++                        self.best_effort_close_inputs()
++                        error_inputs_closed = True
++        finally:
++            # Always release endpoint readers before Endpoint.stop's bounded
++            # wait. Cleanup failures are evidence, never a replacement for the
++            # protocol exception already in flight.
++            self.best_effort_close_inputs()
++        expected = set(self.endpoints)
++        incomplete = []
++        if set(self.held) != expected:
++            incomplete.append('two ENDPOINTs')
++        if set(self.verify_held) != expected or not self.verify_complete:
++            incomplete.append('two matching VERIFYs')
++        if self.done != expected:
++            incomplete.append('BW_DONE from both endpoints')
++        if self.headers != expected:
++            incomplete.append('CSV header from both endpoints')
++        if self.result_endpoints != expected or any(not self.rows[endpoint] for endpoint in self.endpoints):
++            incomplete.append('result and CSV row from both endpoints')
++        if incomplete:
++            raise RuntimeError('Incomplete bandwidth protocol: missing ' + ', '.join(incomplete))
++        self.validate_proof_pairs()
+
+
+ def sha256_file(path):
+@@ -304,7 +646,8 @@ def main(argv=None):
+     parser.add_argument('--mtu', type=int, choices=[1024, 2048, 4096], default=1024)
+     parser.add_argument('--finish', choices=['auto', 'flag', 'imm'], default='auto')
+     parser.add_argument('--timeout', type=int, default=30, help='seconds per trial phase inside mcdma-bw')
+-    parser.add_argument('--verify-bytes', type=int, default=4 << 20)
++    parser.add_argument('--verify-bytes', type=int,
++                        help='explicit aligned verification budget; omitted means auto=min(1MiB,resident capacity)')
+     parser.add_argument('--mac-cq-map', choices=['0', '1', '2'], default='0')
+     parser.add_argument('--mac-user-post', choices=['0', '1'], default='0')
+     parser.add_argument('--mac-user-bf', choices=['0', '64', '128', '64s', 'db'], default='0')
+@@ -324,10 +667,13 @@ def main(argv=None):
+         parser.error('Use the absolute path to libmcdma-rdmav34.so')
+     if not (0 <= args.mac_gid_index <= 255 and 0 <= args.peer_gid_index <= 255):
+         parser.error('Invalid GID index')
+-    if args.total < max(args.sizes) or args.repeats < 1 or args.warmup < 0 or args.timeout < 1 or args.verify_bytes < 8:
++    if (args.total < max(args.sizes) or args.repeats < 1 or args.warmup < 0 or args.timeout < 1 or
++            (args.verify_bytes is not None and (args.verify_bytes < 24 or args.verify_bytes % 8))):
+         parser.error('total must cover the largest request; repeats >= 1; warmup >= 0; timeout >= 1')
+     if bool(args.payload) != bool(args.dump):
+         parser.error('--payload and --dump must be supplied together')
++    if args.payload and args.verify_bytes is not None:
++        parser.error('payload mode performs full CRC verification and does not accept --verify-bytes')
+     if args.payload and (args.ops not in (['write'], ['read']) or args.qps != [1] or
+                          len(args.sizes) != 1 or len(args.depths) != 1 or len(args.initiators) != 1 or
+                          len(args.cq_modes) != 1 or args.repeats != 1 or args.warmup != 0):
+@@ -387,6 +733,26 @@ def main(argv=None):
+         gids = {}
+         for endpoint, payload in held.items():
+             fields, mac_address = descriptor(payload)
++            expected_role = ('initiator' if item['initiator'] == 'mac' else 'responder') if endpoint.host == args.mac_host \
++                else ('responder' if item['initiator'] == 'mac' else 'initiator')
++            expected = {
++                'role': expected_role, 'op': item['op'], 'bytes': str(item['bytes']),
++                'qps': str(item['qps']), 'cqpq': str(item['cq_per_qp']), 'total': str(args.total),
++                'mtu': str(args.mtu), 'psn': str(0x654321), 'payload': str(int(bool(args.payload))),
++                'verify_explicit': str(int(args.verify_bytes is not None)),
++                'verify_requested': str(args.verify_bytes or 0),
++            }
++            if any(fields[key] != value for key, value in expected.items()):
++                raise ValueError(f'{endpoint.host}: ENDPOINT does not match the planned command')
++            if int(fields['depth']) > item['depth']:
++                raise ValueError(f'{endpoint.host}: ENDPOINT depth exceeds the planned command')
++            required_cqe = int(fields['depth']) * (1 if item['cq_per_qp'] else item['qps']) + 1
++            max_cqe = item['depth'] * (1 if item['cq_per_qp'] else item['qps']) + 2
++            if not required_cqe <= int(fields['cqe']) <= max_cqe:
++                raise ValueError(f'{endpoint.host}: ENDPOINT CQ capacity contradicts depth or planned command')
++            expected_imm = int(args.finish == 'imm') if endpoint.host == args.mac_host else int(args.finish != 'flag')
++            if int(fields['imm_recv']) != expected_imm:
++                raise ValueError(f'{endpoint.host}: ENDPOINT immediate-receive mode differs from the planned command')
+             gids[endpoint.host] = (fields['gid'], mac_address)
+         mac_gid, mac_address = gids[args.mac_host]
+         peer_gid, peer_address = gids[args.peer_host]
+@@ -414,7 +780,7 @@ def main(argv=None):
+                 endpoints.append(mac)
+                 peer = cross.Endpoint(args.peer_host, peer_command, log)
+                 endpoints.append(peer)
+-                relay = Relay([mac, peer], log, deadline, check_endpoints)
++                relay = Relay([mac, peer], log, deadline, check_endpoints, args.warmup, 1)
+                 relay.run()
+                 errors.extend(relay.errors)
+                 rows = {('mac' if endpoint is mac else 'peer'): relay.rows[endpoint] for endpoint in endpoints}
+diff --git a/benchmarks/verify_windows.h b/benchmarks/verify_windows.h
+new file mode 100644
+index 0000000..22aff63
+--- /dev/null
++++ b/benchmarks/verify_windows.h
+@@ -0,0 +1,166 @@
++#ifndef MCDMA_VERIFY_WINDOWS_H
++#define MCDMA_VERIFY_WINDOWS_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <stdlib.h>
++
++#define MCDMA_BW_PROTOCOL_VERSION 3u
++#define MCDMA_VERIFY_AUTO_LIMIT (UINT64_C(1) << 20)
++
++struct mcdma_verify_window { uint64_t offset, length; };
++typedef void *(*mcdma_verify_calloc_fn)(size_t, size_t);
++
++enum mcdma_verify_window_error {
++    MCDMA_VERIFY_OK = 0,
++    MCDMA_VERIFY_INVALID,
++    MCDMA_VERIFY_OVERFLOW,
++    MCDMA_VERIFY_OVER_CAPACITY,
++    MCDMA_VERIFY_ALLOCATION,
++    MCDMA_VERIFY_INTERNAL
++};
++
++static const char *mcdma_verify_window_error_name(enum mcdma_verify_window_error error) {
++    switch (error) {
++    case MCDMA_VERIFY_OK: return "ok";
++    case MCDMA_VERIFY_INVALID: return "verify_bytes_invalid_alignment_or_minimum";
++    case MCDMA_VERIFY_OVERFLOW: return "verify_window_arithmetic_or_representation_overflow";
++    case MCDMA_VERIFY_OVER_CAPACITY: return "verify_bytes_exceed_transfer_slots";
++    case MCDMA_VERIFY_ALLOCATION: return "verify_windows_alloc";
++    case MCDMA_VERIFY_INTERNAL: return "verify_windows_internal_contract";
++    }
++    return "verify_windows_unknown_error";
++}
++
++static enum mcdma_verify_window_error
++mcdma_verify_capacity(uint64_t slot_bytes, uint64_t slots, uint64_t *capacity) {
++    if (!capacity || !slot_bytes || !slots || slot_bytes % 8)
++        return MCDMA_VERIFY_INVALID;
++    if (slots > UINT64_MAX / slot_bytes)
++        return MCDMA_VERIFY_OVERFLOW;
++    *capacity = slots * slot_bytes;
++    return MCDMA_VERIFY_OK;
++}
++
++/* Auto is distinct from an explicit budget. It never caps an explicit request:
++ * it selects min(1 MiB, resident capacity). */
++static enum mcdma_verify_window_error
++mcdma_verify_effective_budget(uint64_t slot_bytes, uint64_t slots,
++                              uint64_t requested, int explicit_budget,
++                              uint64_t *effective) {
++    uint64_t capacity = 0;
++    enum mcdma_verify_window_error error = mcdma_verify_capacity(slot_bytes, slots, &capacity);
++    if (error != MCDMA_VERIFY_OK || !effective)
++        return error != MCDMA_VERIFY_OK ? error : MCDMA_VERIFY_INVALID;
++    if (!explicit_budget) {
++        *effective = capacity < MCDMA_VERIFY_AUTO_LIMIT ? capacity : MCDMA_VERIFY_AUTO_LIMIT;
++        return *effective >= 24 ? MCDMA_VERIFY_OK : MCDMA_VERIFY_INVALID;
++    }
++    if (requested < 24 || requested % 8)
++        return MCDMA_VERIFY_INVALID;
++    if (requested > capacity)
++        return MCDMA_VERIFY_OVER_CAPACITY;
++    *effective = requested;
++    return MCDMA_VERIFY_OK;
++}
++
++static enum mcdma_verify_window_error
++mcdma_build_verify_windows_alloc(uint64_t slot_bytes, uint64_t slots,
++                                 uint64_t requested,
++                                 struct mcdma_verify_window **output,
++                                 size_t *output_count,
++                                 mcdma_verify_calloc_fn allocate) {
++    uint64_t capacity = 0, effective = 0;
++    enum mcdma_verify_window_error error = mcdma_verify_capacity(slot_bytes, slots, &capacity);
++    if (error != MCDMA_VERIFY_OK || !output || !output_count || !allocate)
++        return error != MCDMA_VERIFY_OK ? error : MCDMA_VERIFY_INVALID;
++    *output = NULL;
++    *output_count = 0;
++    error = mcdma_verify_effective_budget(slot_bytes, slots, requested, 1, &effective);
++    if (error != MCDMA_VERIFY_OK)
++        return error;
++
++    const uint64_t slot_units = slot_bytes / 8;
++    const uint64_t capacity_units = capacity / 8;
++    const uint64_t requested_units = effective / 8;
++    if (slots > SIZE_MAX / 3)
++        return MCDMA_VERIFY_OVERFLOW;
++    const size_t allocation_count = (size_t)slots * 3;
++    if (!allocation_count || allocation_count > SIZE_MAX / sizeof(struct mcdma_verify_window))
++        return MCDMA_VERIFY_OVERFLOW;
++    struct mcdma_verify_window *windows = allocate(allocation_count, sizeof(*windows));
++    if (!windows)
++        return MCDMA_VERIFY_ALLOCATION;
++
++    /* Place three global first/middle/last extents. Unsampled units become two
++     * gaps; choose the first gap so the global midpoint is inside extent 2. */
++    uint64_t lengths[3]={requested_units/3,requested_units/3,requested_units/3};
++    for (uint64_t i=0;i<requested_units%3;++i) ++lengths[i];
++    const uint64_t gap_units=capacity_units-requested_units;
++    const uint64_t midpoint=capacity_units/2;
++    const uint64_t min_middle_start=midpoint>=lengths[1]-1 ? midpoint-(lengths[1]-1) : 0;
++    const uint64_t max_middle_start=midpoint;
++    const uint64_t min_gap=min_middle_start>lengths[0] ? min_middle_start-lengths[0] : 0;
++    const uint64_t max_gap=max_middle_start>=lengths[0] ? max_middle_start-lengths[0] : 0;
++    if (min_gap>max_gap || min_gap>gap_units) { free(windows); return MCDMA_VERIFY_INTERNAL; }
++    uint64_t first_gap=gap_units/2;
++    if (first_gap<min_gap) first_gap=min_gap;
++    if (first_gap>max_gap) first_gap=max_gap;
++    if (first_gap>gap_units) { free(windows); return MCDMA_VERIFY_INTERNAL; }
++    const uint64_t starts[3]={0,lengths[0]+first_gap,capacity_units-lengths[2]};
++
++    size_t count = 0;
++    uint64_t sum = 0;
++    for (unsigned piece=0;piece<3;++piece) {
++        uint64_t offset_units=starts[piece], remaining=lengths[piece];
++        while (remaining) {
++            const uint64_t within=offset_units%slot_units;
++            const uint64_t available=slot_units-within;
++            const uint64_t chunk=remaining<available ? remaining : available;
++            if (!chunk || count>=allocation_count || offset_units>UINT64_MAX/8 || chunk>UINT64_MAX/8) {
++                free(windows); return MCDMA_VERIFY_INTERNAL;
++            }
++            windows[count].offset=offset_units*8;
++            windows[count].length=chunk*8;
++            if (sum>UINT64_MAX-windows[count].length) { free(windows); return MCDMA_VERIFY_OVERFLOW; }
++            sum+=windows[count].length; ++count;
++            offset_units+=chunk; remaining-=chunk;
++        }
++    }
++    if (!count || sum != effective) {
++        free(windows);
++        return MCDMA_VERIFY_INTERNAL;
++    }
++    for (size_t i = 0; i < count; ++i) {
++        const uint64_t end = windows[i].offset + windows[i].length;
++        if (windows[i].offset % 8 || windows[i].length % 8 || end < windows[i].offset ||
++            windows[i].offset >= capacity || end > capacity ||
++            windows[i].offset / slot_bytes != (end - 1) / slot_bytes ||
++            (i && windows[i - 1].offset + windows[i - 1].length > windows[i].offset)) {
++            free(windows);
++            return MCDMA_VERIFY_INTERNAL;
++        }
++    }
++    *output = windows;
++    *output_count = count;
++    return MCDMA_VERIFY_OK;
++}
++
++static enum mcdma_verify_window_error
++mcdma_build_verify_windows(uint64_t slot_bytes, uint64_t slots, uint64_t requested,
++                           struct mcdma_verify_window **output, size_t *output_count) {
++    return mcdma_build_verify_windows_alloc(slot_bytes, slots, requested,
++                                            output, output_count, calloc);
++}
++
++static int mcdma_verify_protocol_matches(uint64_t version,
++                                         unsigned local_payload, unsigned peer_payload,
++                                         unsigned local_explicit, unsigned peer_explicit,
++                                         uint64_t local_requested, uint64_t peer_requested) {
++    return version == MCDMA_BW_PROTOCOL_VERSION &&
++           local_payload == peer_payload &&
++           local_explicit == peer_explicit &&
++           local_requested == peer_requested;
++}
++
++#endif
+diff --git a/tests/bw_pattern_trial.c b/tests/bw_pattern_trial.c
+new file mode 100644
+index 0000000..c6af172
+--- /dev/null
++++ b/tests/bw_pattern_trial.c
+@@ -0,0 +1,64 @@
++/* Exercise the production pattern trial branches with shared memory replacing
++ * RDMA. The Python relay supplies only the real control messages. */
++#include <infiniband/verbs.h>
++#include <assert.h>
++#include <fcntl.h>
++#include <string.h>
++#include <sys/mman.h>
++
++static struct ibv_wc pending[128];
++static unsigned pending_head,pending_tail;
++static const char *fault;
++static int corrupted;
++
++static int copy_post(struct ibv_qp *qp,struct ibv_send_wr *wr,struct ibv_send_wr **bad) {
++    (void)qp; (void)bad; assert(pending_tail<128);
++    void *local=(void *)(uintptr_t)wr->sg_list->addr;
++    void *remote=(void *)(uintptr_t)wr->wr.rdma.remote_addr;
++    const unsigned kind=(unsigned)((wr->wr_id>>48)&0xff);
++    const int read_op=wr->opcode==IBV_WR_RDMA_READ;
++    assert(read_op || wr->opcode==IBV_WR_RDMA_WRITE);
++    memcpy(read_op?local:remote,read_op?remote:local,wr->sg_list->length);
++    if (kind==1 /* WR_DATA */ && !corrupted++ && !strcmp(fault,"corrupt"))
++        ((unsigned char *)(read_op?local:remote))[0]^=1;
++    struct ibv_wc *wc=&pending[pending_tail++];
++    wc->wr_id=wr->wr_id; wc->opcode=read_op?IBV_WC_RDMA_READ:IBV_WC_RDMA_WRITE;
++    wc->status=IBV_WC_SUCCESS;
++    return 0;
++}
++static int copy_poll(struct ibv_cq *cq,int maximum,struct ibv_wc *wc) {
++    (void)cq; int count=0;
++    while (pending_head<pending_tail && count<maximum) wc[count++]=pending[pending_head++];
++    return count;
++}
++#define ibv_post_send copy_post
++#define ibv_poll_cq copy_poll
++#define main benchmark_main
++#include "../benchmarks/mcdma_bw.c"
++#undef main
++
++int main(int argc,char **argv) {
++    assert(argc==5); setvbuf(stdout,NULL,_IOLBF,0);
++    struct bench b={0};
++    b.o.initiator=!strcmp(argv[1],"initiator");
++    b.o.op=!strcmp(argv[2],"read")?OP_READ:OP_WRITE;
++    assert(b.o.op==OP_READ || !strcmp(argv[2],"write"));
++    fault=argv[4]; assert(!strcmp(fault,"good") || !strcmp(fault,"corrupt"));
++    b.o.qps=b.cqs=1; b.o.bytes=4u<<20; b.o.depth=b.depth_local=b.depth=b.depth_effective=1;
++    b.o.total=4u<<20; b.o.repeats=1; b.o.timeout_s=1;
++    b.o.verify_explicit=1; b.o.verify_bytes=1u<<20;
++    b.cq_cap[0]=32; b.region_bytes=(4u<<20)+GUARD_BYTES+FLAG_BYTES;
++    int fd=open(argv[3],O_RDWR); assert(fd>=0);
++    unsigned char *regions=mmap(NULL,2*b.region_bytes,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
++    assert(regions!=MAP_FAILED); close(fd);
++    b.region=regions+(b.o.initiator?0:b.region_bytes);
++    b.remote.addr=(uintptr_t)(regions+(b.o.initiator?b.region_bytes:0));
++    b.remote.length=b.region_bytes;
++    struct ibv_mr mr={0}; b.mr=&mr; b.nonce=UINT64_C(0x123456789); b.finish_imm=0;
++    build_windows(&b);
++    const int receiver=(b.o.op==OP_READ && b.o.initiator) || (b.o.op==OP_WRITE && !b.o.initiator);
++    const int ok=b.o.initiator?run_initiator_trial(&b,0,0):run_responder_trial(&b,0,0);
++    printf("PATTERN_BRANCH op=%s role=%s receiver=%d ok=%d\n",argv[2],argv[1],receiver,ok);
++    free(b.windows); assert(!munmap(regions,2*b.region_bytes));
++    return ok?0:3;
++}
+diff --git a/tests/bw_payload_trial.c b/tests/bw_payload_trial.c
+index de1f7fe..2cb7e54 100644
+--- a/tests/bw_payload_trial.c
++++ b/tests/bw_payload_trial.c
+@@ -51,6 +51,7 @@ int main(int argc, char **argv) {
+     b.o.qps = b.cqs = 1;
+     b.o.bytes = 4096;
+     b.o.depth = b.depth = b.depth_effective = 4;
++    b.o.repeats = 1;
+     b.o.timeout_s = 3;
+     b.o.verify_bytes = 16384;
+     b.cq_cap[0] = 32;
+diff --git a/tests/test_bw_pattern_trial.py b/tests/test_bw_pattern_trial.py
+new file mode 100644
+index 0000000..dd6120d
+--- /dev/null
++++ b/tests/test_bw_pattern_trial.py
+@@ -0,0 +1,260 @@
++#!/usr/bin/env python3
++import os,pathlib,selectors,shutil,subprocess,sys,tempfile,threading,time,unittest
++
++ROOT=pathlib.Path(__file__).resolve().parents[1]
++
++class PatternTrialTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        compiler=shutil.which('clang') or shutil.which('cc')
++        if not compiler: raise unittest.SkipTest('C compiler required')
++        cls.temp=tempfile.TemporaryDirectory(); cls.binary=pathlib.Path(cls.temp.name)/'pattern-trial'
++        subprocess.run([compiler,'-std=c11','-D_POSIX_C_SOURCE=200809L','-D_DARWIN_C_SOURCE','-O1',
++                        '-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
++                        str(ROOT/'tests/bw_pattern_trial.c'),'-lrdma' if sys.platform=='darwin' else '-libverbs',
++                        '-o',str(cls.binary)],check=True)
++    @classmethod
++    def tearDownClass(cls): cls.temp.cleanup()
++
++    def trial(self,operation,fault='good',wire_fault=None,trailing_delay=.015):
++        with tempfile.TemporaryDirectory() as directory:
++            shared=pathlib.Path(directory)/'shared'; region=(4<<20)+16384+64
++            shared.write_bytes(b'\x5a'*(2*region))
++            processes=[]; logs=[[],[]]; partial=[b'',b'']; final_acks=set(); attacks=[]
++            self.attack_outcomes=[]
++
++            def close_inputs():
++                for process in processes:
++                    try: process.stdin.close()
++                    except (BrokenPipeError,OSError,ValueError): pass
++
++            def delayed_attack(process,payload,delay):
++                time.sleep(delay)
++                try:
++                    process.stdin.write(payload); process.stdin.flush()
++                    self.attack_outcomes.append(('written',delay))
++                except (BrokenPipeError,OSError,ValueError):
++                    self.attack_outcomes.append(('rejected',delay))
++
++            with selectors.DefaultSelector() as selector:
++                try:
++                    for index,role in enumerate(('initiator','responder')):
++                        process=subprocess.Popen([str(self.binary),role,operation,str(shared),fault],
++                                                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
++                        processes.append(process); selector.register(process.stdout,selectors.EVENT_READ,index)
++                    deadline=time.monotonic()+12
++                    while selector.get_map():
++                        self.assertLess(time.monotonic(),deadline,logs)
++                        for key,_ in selector.select(.1):
++                            index=key.data; chunk=os.read(key.fileobj.fileno(),65536)
++                            if not chunk:
++                                selector.unregister(key.fileobj)
++                                if wire_fault!='no-eof':
++                                    try: processes[1-index].stdin.close()
++                                    except (BrokenPipeError,OSError,ValueError,AttributeError): pass
++                                continue
++                            partial[index]+=chunk
++                            while b'\n' in partial[index]:
++                                line,partial[index]=partial[index].split(b'\n',1); logs[index].append(line.decode(errors='replace'))
++                                if line.startswith(b'BW_MSG '):
++                                    payload=line[7:]
++                                    complete_faults=('old','missing','duplicate','wrong-receiver','contradiction','wrong-verified')
++                                    if index==0 and payload.startswith(b'COMPLETE ') and wire_fault in complete_faults:
++                                        if wire_fault=='old': payload=payload.replace(b' v=3',b'',1)
++                                        elif wire_fault=='missing': payload=payload.rsplit(b' ',1)[0]
++                                        elif wire_fault=='duplicate': payload+=b' verified=1048576'
++                                        elif wire_fault=='wrong-receiver': payload=payload.replace(b'receiver=initiator',b'receiver=responder',1)
++                                        elif wire_fault=='contradiction': payload=payload.replace(b'mismatches=0',b'mismatches=1',1)
++                                        elif wire_fault=='wrong-verified': payload=payload.replace(b'verified=1048576',b'verified=1048568',1)
++                                        else: self.fail(f'unknown wire fault {wire_fault}')
++                                    if index==1 and payload.startswith(b'DONE ') and wire_fault and wire_fault.startswith('done-') and wire_fault!='done-repeat':
++                                        fault_name=wire_fault[5:]
++                                        if fault_name=='old': payload=payload.replace(b' v=3',b'',1)
++                                        elif fault_name=='missing': payload=payload.rsplit(b' ',1)[0]
++                                        elif fault_name=='duplicate': payload+=b' verified=1048576'
++                                        elif fault_name=='wrong-receiver': payload=payload.replace(b'receiver=responder',b'receiver=initiator',1)
++                                        elif fault_name=='wrong-verified': payload=payload.replace(b'verified=1048576',b'verified=1048568',1)
++                                        else: self.fail(f'unknown DONE wire fault {wire_fault}')
++                                    repeat=((index==0 and payload.startswith(b'COMPLETE ') and wire_fault=='repeat-complete') or
++                                            (index==1 and payload.startswith(b'DONE ') and wire_fault=='done-repeat'))
++                                    confirm=(index==0 and payload.startswith(b'CONFIRM '))
++                                    confirmed=(index==1 and payload.startswith(b'CONFIRMED '))
++                                    delay=((confirm and wire_fault=='delay-confirm') or
++                                           (confirmed and wire_fault=='delay-confirmed'))
++                                    queued=None
++                                    if confirm and wire_fault=='queued-extra-confirm': queued=b'EXTRA after=confirm\n'
++                                    elif confirmed and wire_fault=='queued-extra-confirmed': queued=b'EXTRA after=confirmed\n'
++                                    elif confirm and wire_fault=='queued-partial-confirm': queued=b'EXTRA_PARTIAL'
++                                    elif confirmed and wire_fault=='queued-partial-confirmed': queued=b'EXTRA_PARTIAL'
++                                    trailing=None
++                                    if confirm and wire_fault=='repeat-confirm': trailing=payload+b'\n'
++                                    elif confirmed and wire_fault=='repeat-confirmed': trailing=payload+b'\n'
++                                    elif confirm and wire_fault=='extra-confirm': trailing=b'EXTRA after=confirm\n'
++                                    elif confirmed and wire_fault=='extra-confirmed': trailing=b'EXTRA after=confirmed\n'
++                                    elif confirm and wire_fault=='partial-confirm': trailing=b'EXTRA_PARTIAL'
++                                    elif confirmed and wire_fault=='partial-confirmed': trailing=b'EXTRA_PARTIAL'
++                                    try:
++                                        if delay: time.sleep(.03)
++                                        processes[1-index].stdin.write(payload+b'\n'+(queued or b'')); processes[1-index].stdin.flush()
++                                        if queued is not None: self.attack_outcomes.append(('written',0))
++                                        if repeat:
++                                            time.sleep(.01)
++                                            processes[1-index].stdin.write(payload+b'\n'); processes[1-index].stdin.flush()
++                                        if trailing is not None:
++                                            attack=threading.Thread(target=delayed_attack,
++                                                                    args=(processes[1-index],trailing,trailing_delay))
++                                            attack.start(); attacks.append(attack)
++                                        if confirm: final_acks.add('CONFIRM')
++                                        if confirmed: final_acks.add('CONFIRMED')
++                                        if final_acks=={'CONFIRM','CONFIRMED'} and wire_fault!='no-eof':
++                                            close_inputs()
++                                            post_close=None
++                                            if wire_fault=='post-close-confirm': post_close=processes[1]
++                                            elif wire_fault=='post-close-confirmed': post_close=processes[0]
++                                            if post_close is not None:
++                                                try:
++                                                    post_close.stdin.write(b'EXTRA_AFTER_CLOSE\n'); post_close.stdin.flush()
++                                                    self.attack_outcomes.append(('written',0))
++                                                except (BrokenPipeError,OSError,ValueError):
++                                                    self.attack_outcomes.append(('rejected',0))
++                                    except (BrokenPipeError,OSError,ValueError): pass
++                    for attack in attacks: attack.join(timeout=1)
++                    self.assertTrue(all(not attack.is_alive() for attack in attacks))
++                    codes=[process.wait(timeout=2) for process in processes]
++                finally:
++                    for process in processes:
++                        if process.poll() is None:
++                            process.terminate()
++                            try: process.wait(timeout=2)
++                            except subprocess.TimeoutExpired: self.fail(f'surviving child pid={process.pid}')
++                        for stream in (process.stdin,process.stdout):
++                            try: stream.close()
++                            except (BrokenPipeError,OSError,ValueError,AttributeError): pass
++            return codes,logs
++
++    @staticmethod
++    def result(log):
++        return next(line for line in log if line.startswith('BW_RESULT '))
++
++    def assert_trailing_blocked_or_rejected(self,codes,logs,receiver_index):
++        self.assertEqual(len(self.attack_outcomes),1,self.attack_outcomes)
++        outcome,_=self.attack_outcomes[0]
++        if outcome=='written':
++            self.assertNotEqual(codes[receiver_index],0,logs)
++            combined='\n'.join(line for log in logs for line in log)
++            self.assertIn('BW_ERROR what=protocol_trailing_control',combined)
++        else:
++            self.assertEqual(outcome,'rejected')
++            self.assertEqual(codes,[0,0],logs)
++
++    def test_both_rows_carry_exact_receiver_proof_and_source(self):
++        for operation,receiver_index,receiver_role in (('read',0,'initiator'),('write',1,'responder')):
++            good,logs=self.trial(operation)
++            self.assertEqual(good,[0,0],logs)
++            branch=next(line for line in logs[receiver_index] if line.startswith('PATTERN_BRANCH '))
++            self.assertIn(f'role={receiver_role} receiver=1 ok=1',branch)
++            for index,source in enumerate(('local','peer') if operation=='read' else ('peer','local')):
++                result=self.result(logs[index])
++                self.assertIn('verified_bytes=1048576',result)
++                self.assertIn('mismatches=0',result)
++                self.assertIn('guard_ok=1',result)
++                self.assertIn(f'verification_source={source}',result)
++                self.assertIn(f'verification_receiver={receiver_role}',result)
++                header=next(line[14:] for line in logs[index] if line.startswith('BW_CSV_HEADER '))
++                row=next(line[7:] for line in logs[index] if line.startswith('BW_CSV '))
++                values=dict(zip(header.split(','),row.split(',')))
++                self.assertEqual(values['verified_bytes'],'1048576')
++                self.assertEqual(values['mismatches'],'0')
++                self.assertEqual(values['guard_ok'],'1')
++                self.assertEqual(values['verification_source'],source)
++                self.assertEqual(values['verification_receiver'],receiver_role)
++
++    def test_corruption_fails_both_rows_without_losing_receiver_proof(self):
++        for operation,receiver_index in (('read',0),('write',1)):
++            bad,bad_logs=self.trial(operation,'corrupt')
++            self.assertNotEqual(bad[receiver_index],0,bad_logs)
++            self.assertTrue(all(code!=0 for code in bad),bad_logs)
++            for log in bad_logs:
++                result=self.result(log)
++                self.assertIn('verified_bytes=1048576',result)
++                self.assertRegex(result,r'mismatches=[1-9][0-9]*')
++
++    def test_old_missing_duplicate_and_contradictory_complete_proof_fail(self):
++        for fault in ('old','missing','duplicate','wrong-receiver','contradiction','wrong-verified'):
++            with self.subTest(fault=fault):
++                codes,logs=self.trial('read',wire_fault=fault)
++                self.assertTrue(all(code!=0 for code in codes),logs)
++                combined='\n'.join(line for log in logs for line in log)
++                self.assertIn('BW_ERROR what=protocol_',combined)
++
++    def test_old_missing_duplicate_and_contradictory_done_proof_fail(self):
++        for fault in ('done-old','done-missing','done-duplicate','done-wrong-receiver','done-wrong-verified'):
++            with self.subTest(fault=fault):
++                codes,logs=self.trial('write',wire_fault=fault)
++                self.assertNotEqual(codes[0],0,logs)
++                combined='\n'.join(line for log in logs for line in log)
++                self.assertIn('BW_ERROR what=protocol_',combined)
++
++    def test_duplicate_terminal_records_fail_in_both_directions(self):
++        for operation in ('read','write'):
++            for fault,receiver_index,terminal in (('repeat-complete',1,'COMPLETE'),('done-repeat',0,'DONE')):
++                with self.subTest(operation=operation,fault=fault):
++                    codes,logs=self.trial(operation,wire_fault=fault)
++                    self.assertNotEqual(codes[receiver_index],0,logs)
++                    combined='\n'.join(line for log in logs for line in log)
++                    self.assertIn(f'BW_ERROR what=protocol_duplicate_{terminal}',combined)
++
++    def test_final_ack_rejects_or_prevents_delayed_complete_and_partial_trailing_records(self):
++        faults=(('repeat-confirm',1),('repeat-confirmed',0),
++                ('extra-confirm',1),('extra-confirmed',0),
++                ('partial-confirm',1),('partial-confirmed',0))
++        for operation in ('read','write'):
++            for fault,receiver_index in faults:
++                with self.subTest(operation=operation,fault=fault):
++                    codes,logs=self.trial(operation,wire_fault=fault)
++                    self.assert_trailing_blocked_or_rejected(codes,logs,receiver_index)
++
++    def test_partial_trailing_races_at_40_49_55_and_80ms_never_succeed(self):
++        for operation in ('read','write'):
++            for fault,receiver_index in (('partial-confirm',1),('partial-confirmed',0)):
++                for delay in (.040,.049,.055,.080):
++                    with self.subTest(operation=operation,fault=fault,delay=delay):
++                        codes,logs=self.trial(operation,wire_fault=fault,trailing_delay=delay)
++                        self.assert_trailing_blocked_or_rejected(codes,logs,receiver_index)
++
++    def test_queued_final_ack_trailing_bytes_fail_deterministically(self):
++        faults=(('queued-extra-confirm',1),('queued-extra-confirmed',0),
++                ('queued-partial-confirm',1),('queued-partial-confirmed',0))
++        for operation in ('read','write'):
++            for fault,receiver_index in faults:
++                with self.subTest(operation=operation,fault=fault):
++                    codes,logs=self.trial(operation,wire_fault=fault)
++                    self.assertEqual(self.attack_outcomes,[('written',0)])
++                    self.assertEqual(codes[receiver_index],2,logs)
++                    combined='\n'.join(line for log in logs for line in log)
++                    self.assertIn('BW_ERROR what=protocol_trailing_control',combined)
++
++    def test_post_close_control_writes_are_refused(self):
++        for operation in ('read','write'):
++            for fault in ('post-close-confirm','post-close-confirmed'):
++                with self.subTest(operation=operation,fault=fault):
++                    codes,logs=self.trial(operation,wire_fault=fault)
++                    self.assertEqual(self.attack_outcomes,[('rejected',0)])
++                    self.assertEqual(codes,[0,0],logs)
++
++    def test_delayed_single_final_ack_succeeds(self):
++        for operation in ('read','write'):
++            for fault in ('delay-confirm','delay-confirmed'):
++                with self.subTest(operation=operation,fault=fault):
++                    codes,logs=self.trial(operation,wire_fault=fault)
++                    self.assertEqual(codes,[0,0],logs)
++
++    def test_final_ack_times_out_when_controller_never_closes_input(self):
++        for operation in ('read','write'):
++            with self.subTest(operation=operation):
++                codes,logs=self.trial(operation,wire_fault='no-eof')
++                self.assertTrue(all(code!=0 for code in codes),logs)
++                combined='\n'.join(line for log in logs for line in log)
++                self.assertEqual(combined.count('BW_ERROR what=protocol_final_eof_wait'),2)
++
++if __name__=='__main__': unittest.main(verbosity=2)
+diff --git a/tests/test_bw_payload.py b/tests/test_bw_payload.py
+index 1474492..47912a3 100644
+--- a/tests/test_bw_payload.py
++++ b/tests/test_bw_payload.py
+@@ -136,6 +136,17 @@ int main(int argc,char **argv) {
+             self.assertNotEqual(result.returncode, 0, extra)
+             self.assertIn('BW_ERROR', result.stdout)
+
++    def test_payload_full_crc_bypasses_window_budget(self):
++        base = ['parse', '--device', 'test-device', '--role', 'initiator', '--op', 'write',
++                '--payload', '/test/source', '--warmup', '0', '--repeats', '1']
++        for budget in ('0', '15', '999999999999999999999999999999'):
++            result = subprocess.run([str(self.binary)] + base + ['--verify-bytes', budget],
++                                    capture_output=True, text=True)
++            if budget.startswith('999'):
++                self.assertNotEqual(result.returncode, 0)
++            else:
++                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
+     def test_runner_routes_files_by_data_direction(self):
+         args = SimpleNamespace(total=65536, warmup=0, mtu=1024, finish='flag', timeout=30,
+                                verify_bytes=4096, payload='/test/source', dump='/test/dest')
+diff --git a/tests/test_bw_payload_trial.py b/tests/test_bw_payload_trial.py
+index 301b8fe..d00e7dd 100644
+--- a/tests/test_bw_payload_trial.py
++++ b/tests/test_bw_payload_trial.py
+@@ -38,7 +38,7 @@ class PayloadTrialTests(unittest.TestCase):
+             shared.write_bytes(b'\x5a' * (2 * (16384 + 16384 + 64)))
+             if existing is not None:
+                 dest.write_bytes(existing)
+-            processes, logs, partial = [], [[], []], [b'', b'']
++            processes, logs, partial, final_acks = [], [[], []], [b'', b''], set()
+             with selectors.DefaultSelector() as selector:
+                 try:
+                     for index, role in enumerate(('initiator', 'responder')):
+@@ -64,9 +64,17 @@ class PayloadTrialTests(unittest.TestCase):
+                                 logs[index].append(line.decode(errors='replace'))
+                                 if line.startswith(b'BW_MSG '):
+                                     try:
+-                                        processes[1 - index].stdin.write(line[7:] + b'\n')
++                                        payload = line[7:]
++                                        processes[1 - index].stdin.write(payload + b'\n')
+                                         processes[1 - index].stdin.flush()
+-                                    except BrokenPipeError:
++                                        if payload.startswith(b'CONFIRM '):
++                                            final_acks.add('CONFIRM')
++                                        if payload.startswith(b'CONFIRMED '):
++                                            final_acks.add('CONFIRMED')
++                                        if final_acks == {'CONFIRM', 'CONFIRMED'}:
++                                            for process in processes:
++                                                process.stdin.close()
++                                    except (BrokenPipeError, OSError, ValueError):
+                                         pass
+                     codes = [p.wait(timeout=2) for p in processes]
+                 finally:
+@@ -77,7 +85,7 @@ class PayloadTrialTests(unittest.TestCase):
+                         for stream in (p.stdin, p.stdout):
+                             try:
+                                 stream.close()
+-                            except BrokenPipeError:
++                            except (BrokenPipeError, OSError, ValueError):
+                                 pass
+             return codes, dest.read_bytes() if dest.exists() else None, logs
+
+diff --git a/tests/test_bw_tools.py b/tests/test_bw_tools.py
+index a7d2404..1df0908 100644
+--- a/tests/test_bw_tools.py
++++ b/tests/test_bw_tools.py
+@@ -21,6 +21,7 @@ def load(name, relative):
+
+ run_bw = load('run_bw', 'benchmarks/run_bw.py')
+ bw_summary = load('bw_summary', 'benchmarks/bw_summary.py')
++REAL_POPEN = run_bw.subprocess.Popen
+
+ # Synthetic identifiers only: no lab host, path or address appears here.
+ BASE_ARGS = ['--mac-host', 'mac-test', '--peer-host', 'linux-test',
+@@ -71,11 +72,19 @@ class SweepTests(unittest.TestCase):
+         self.assertIn('initiator', peer)
+         for command in (mac, peer):
+             self.assertIn('--cq-per-qp', command)
++            self.assertEqual(command[command.index('--verify-bytes') + 1], '8192')
+             self.assertEqual(command[command.index('--repeats') + 1], '1')
+             self.assertEqual(command[command.index('--mtu') + 1], '4096')
+         self.assertEqual(mac[mac.index('--gid-index') + 1], '0')
+         self.assertEqual(peer[peer.index('--gid-index') + 1], '3')
+
++    def test_auto_verification_omits_explicit_budget(self):
++        args = run_bw.argparse.Namespace(total=1 << 20, warmup=1, mtu=4096, finish='flag', timeout=30,
++                                         verify_bytes=None)
++        config = dict(op='write', bytes=4096, depth=1, qps=1, cq_per_qp=0)
++        command = run_bw.program_arguments(config, 'initiator', 'test-device', 0, args)
++        self.assertNotIn('--verify-bytes', command)
++
+     def test_dry_run_prints_commands_and_never_uses_ssh(self):
+         with tempfile.TemporaryDirectory() as directory:
+             output = Path(directory) / 'sweep'
+@@ -110,6 +119,13 @@ class SweepTests(unittest.TestCase):
+             with self.subTest(extra=extra), patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit):
+                 run_bw.main(BASE_ARGS + extra + ['--output', '/nonexistent/test-output', '--dry-run'])
+
++    def test_payload_rejects_irrelevant_window_budget(self):
++        with patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit):
++            run_bw.main(BASE_ARGS + ['--ops', 'write', '--sizes', '4096', '--depths', '1', '--qps', '1',
++                                     '--initiators', 'mac', '--repeats', '1', '--warmup', '0',
++                                     '--payload', '/tmp/source', '--dump', '/tmp/dump', '--verify-bytes', '24',
++                                     '--output', '/nonexistent/test-output', '--dry-run'])
++
+     def run_interrupted(self, signum):
+         endpoints = []
+
+@@ -199,18 +215,45 @@ class SweepTests(unittest.TestCase):
+         self.assertIn('pid 4321 survived', ' '.join(manifest['runs'][0]['errors']))
+
+     def test_descriptor_validation(self):
+-        good = ('ENDPOINT v=1 nonce=7 role=initiator op=write bytes=65536 depth=16 qps=2 cqpq=0 cqe=31 total=67108864 '
+-                'mtu=1024 imm_recv=0 rd=1 psn=6636321 rkey=4660 addr=4294967296 length=2113536 gid=fe80::ff:fe00:1 qpn=17,18')
++        good = ('ENDPOINT v=3 nonce=7 role=initiator op=write bytes=65536 depth=16 qps=2 cqpq=0 cqe=31 total=67108864 '
++                'mtu=1024 imm_recv=0 rd=1 psn=6636321 rkey=4660 addr=4294967296 length=2113536 '
++                'gid=fe80::ff:fe00:1 qpn=17,18 payload=0 verify_explicit=1 verify_requested=1048576')
+         fields, mac = run_bw.descriptor(good)
+         self.assertEqual(mac, '02:00:00:00:00:01')
+         self.assertEqual(fields['qpn'], '17,18')
+         for bad in (good.replace('qpn=17,18', 'qpn=17'), good.replace('gid=fe80::ff:fe00:1', 'gid=2001:db8::1'),
+                     good.replace('rkey=4660', 'rkey=0'), good.replace('op=write', 'op=atomic'),
+-                    good.replace(' length=2113536', ''), good.replace('ENDPOINT', 'READY'),
+-                    good.replace('addr=4294967296', 'addr=18446744073709551615')):
++                    good.replace(' length=2113536', ''), good.replace('ENDPOINT', 'READY'), good.replace('v=3', 'v=2'),
++                    good.replace('length=2113536', 'length=2113528'),
++                    good.replace('verify_requested=1048576', 'verify_requested=1048577'),
++                    good.replace('addr=4294967296', 'addr=18446744073709551615'), good + ' extension=1'):
+             with self.subTest(bad=bad), self.assertRaises(ValueError):
+                 run_bw.descriptor(bad)
+
++    def test_complete_v3_pair_and_effective_verification(self):
++        initiator = ('ENDPOINT v=3 nonce=7 role=initiator op=read bytes=4194304 depth=1 qps=1 cqpq=0 cqe=3 '
++                     'total=8589934592 mtu=4096 imm_recv=0 rd=1 psn=6636321 rkey=4660 addr=4294967296 '
++                     'length=4210688 gid=fe80::ff:fe00:1 qpn=17 payload=0 verify_explicit=1 '
++                     'verify_requested=1048576')
++        responder = initiator.replace('nonce=7 role=initiator', 'nonce=0 role=responder').replace(
++            'rkey=4660 addr=4294967296', 'rkey=4661 addr=8589934592').replace(
++            'gid=fe80::ff:fe00:1 qpn=17', 'gid=fe80::ff:fe00:2 qpn=18')
++        self.assertEqual(run_bw.endpoint_pair({'initiator': initiator, 'responder': responder}), 1048576)
++        auto = {key: value.replace('verify_explicit=1 verify_requested=1048576',
++                                   'verify_explicit=0 verify_requested=0')
++                for key, value in {'initiator': initiator, 'responder': responder}.items()}
++        self.assertEqual(run_bw.endpoint_pair(auto), 1048576)
++        for bad in (responder.replace('op=read', 'op=write'), responder.replace('nonce=0', 'nonce=9'),
++                    responder.replace('verify_requested=1048576', 'verify_requested=524288')):
++            with self.subTest(bad=bad), self.assertRaises(ValueError):
++                run_bw.endpoint_pair({'initiator': initiator, 'responder': bad})
++
++    def test_exact_verify_message(self):
++        self.assertEqual(run_bw.verification('VERIFY bytes=1048576'), 1048576)
++        for bad in ('VERIFY', 'VERIFY bytes=1 extra=2', 'VERIFY bytes=-1', 'READY bytes=1048576'):
++            with self.subTest(bad=bad), self.assertRaises(ValueError):
++                run_bw.verification(bad)
++
+     def test_mac_mode_markers_count_queues(self):
+         disabled = 'MCDMA_CQ_OBSERVER mapped=0 reason=disabled\n'
+         run_bw.mac_mode_markers(disabled * 2, '0', '0', '0', 2, 2)
+@@ -233,31 +276,136 @@ class SweepTests(unittest.TestCase):
+
+ FAKE_ENDPOINT = r'''
+ import sys
+-role, gid = sys.argv[1], sys.argv[2]
++role, gid, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+ def out(text):
+     sys.stdout.write(text + '\n'); sys.stdout.flush()
+ out('BW_CONFIG role=' + role)
+-out('BW_MSG ENDPOINT v=1 nonce=7 role=%s op=write bytes=65536 depth=16 qps=1 cqpq=0 cqe=31 total=67108864 mtu=1024 '
+-    'imm_recv=0 rd=1 psn=1 rkey=4660 addr=4294967296 length=2113536 gid=%s qpn=17' % (role, gid))
++sys.stderr.write('MCDMA_CQ_OBSERVER mapped=0 reason=disabled\n'); sys.stderr.flush()
++if mode == 'stall':
++    assert sys.stdin.read() == ''
++    raise SystemExit(0)
++if mode == 'incomplete':
++    raise SystemExit(0)
++if mode == 'premature':
++    out('BW_CSV_HEADER side,trial')
++    out('BW_CSV %s,0' % role)
++    out('BW_RESULT side=%s trial=0' % role)
++    out('BW_DONE trials=1 failed=0 cleanup=0')
++    raise SystemExit(0)
++version = 2 if mode == 'v2' else 3
++nonce = 7 if role == 'initiator' else 0
++rkey = 4660 if role == 'initiator' else 4661
++addr = 4294967296 if role == 'initiator' else 8589934592
++qpn = 17 if role == 'initiator' else 18
++requested = 524288 if mode == 'endpoint-mismatch' and role == 'responder' else 1048576
++cqe = 16 if mode == 'cqe-low' else 18
++endpoint = ('ENDPOINT v=%d nonce=%d role=%s op=write bytes=65536 depth=16 qps=1 cqpq=0 cqe=%d total=67108864 '
++            'mtu=1024 imm_recv=0 rd=1 psn=%d rkey=%d addr=%d length=1064960 gid=%s qpn=%d payload=0 '
++            'verify_explicit=1 verify_requested=%d' %
++            (version, nonce, role, cqe, 1 if mode == 'alternate-psn' else 6636321,
++             rkey, addr, gid, qpn, requested))
++if mode == 'missing' and role == 'initiator':
++    endpoint = endpoint.replace(' verify_requested=1048576', '')
++out('BW_MSG ' + endpoint)
+ peer = sys.stdin.readline().strip()
++if not peer:
++    raise SystemExit(3)
++sys.stderr.write('FORWARDED_ENDPOINT\n'); sys.stderr.flush()
+ assert peer.startswith('ENDPOINT ') and ('role=responder' if role == 'initiator' else 'role=initiator') in peer, peer
++verify = 524288 if mode == 'verify-mismatch' and role == 'responder' else 1048576
++out('BW_MSG VERIFY bytes=%d' % verify)
++peer_verify = sys.stdin.readline().strip()
++if not peer_verify:
++    raise SystemExit(4)
++assert peer_verify == 'VERIFY bytes=1048576', peer_verify
++sys.stderr.write('DATA_PHASE\n'); sys.stderr.flush()
+ out('BW_MSG READY rd=1')
+ assert sys.stdin.readline().strip() == 'READY rd=1'
+-out('BW_CSV_HEADER side,trial')
+-out('BW_CSV %s,0' % role)
+-out('BW_RESULT side=%s trial=0' % role)
+-out('BW_DONE trials=1 failed=0 cleanup=0')
++if mode == 'csv-before-header':
++    out('BW_CSV %s,0' % role)
++    raise SystemExit(0)
++if mode == 'non-ascii-split':
++    sys.stdout.buffer.write(b'BW_CSV_HEADER side,\xc3'); sys.stdout.buffer.flush()
++    sys.stdout.buffer.write(b'\xa9\n'); sys.stdout.buffer.flush()
++    raise SystemExit(0)
++if role == 'initiator':
++    out('BW_MSG COMPLETE v=3 trial=0 ok=1 receiver=responder proof=none verified=0 mismatches=0 guard_ok=0')
++    assert sys.stdin.readline().startswith('DONE v=3 trial=0 ')
++    out('BW_MSG CONFIRM v=3 trial=0')
++    assert sys.stdin.readline().strip() == 'CONFIRMED v=3 trial=0'
++else:
++    assert sys.stdin.readline().startswith('COMPLETE v=3 trial=0 ')
++    out('BW_MSG DONE v=3 trial=0 seconds=1.000000 cpu_pct=1.0 receiver=responder verified=1048576 '
++        'mismatches=0 errors=0 completions=1024 guard_ok=1')
++    assert sys.stdin.readline().strip() == 'CONFIRM v=3 trial=0'
++    if mode == 'confirmed-extra-message':
++        sys.stdout.buffer.write(b'BW_MSG CONFIRMED v=3 trial=0\nBW_MSG EXTRA after=confirmed\n')
++        sys.stdout.buffer.flush()
++    elif mode == 'confirmed-extra-partial':
++        sys.stdout.buffer.write(b'BW_MSG CONFIRMED v=3 trial=0\nBW_MSG EXTRA_PARTIAL')
++        sys.stdout.buffer.flush()
++    else:
++        out('BW_MSG CONFIRMED v=3 trial=0')
++assert sys.stdin.read() == ''
++header = ('side,trial,warmup,op,bytes,depth,depth_effective,qps,cq_per_qp,cqe,mtu,total_bytes,wrs,'
++          'seconds,gbit,completions,errors,cpu_pct,responder_seconds,responder_cpu_pct,verified_bytes,'
++          'mismatches,verification_source,verification_receiver,finish,rd_atomic,post_retries,guard_ok,measurement')
++side = role
++op = 'write'
++trial = '0'
++warmup = '1' if mode == 'warmup-one' else '0'
++verified = '1048576'
++source = 'local' if role == 'responder' else 'peer'
++receiver = 'responder'
++if mode == 'lying-proof':
++    verified, source, receiver = '0', 'local', 'initiator'
++elif mode == 'wrong-side':
++    side = 'responder' if role == 'initiator' else 'initiator'
++elif mode == 'wrong-direction':
++    op = 'read'
++elif mode == 'wrong-trial':
++    trial = '7'
++values = [side, trial, warmup, op, '65536', '16', '16', '1', '0', '18', '1024', '67108864', '1024',
++          '1.000000', '0.5369', '1024', '0', '1.0', '1.000000', '1.0', verified, '0', source,
++          receiver, 'flag', '1', '0', '1', 'pattern-bandwidth']
++row = ','.join(values)
++result = ' '.join(key + '=' + value for key, value in zip(header.split(','), values))
++if mode == 'split-ascii':
++    sys.stdout.write('BW_CSV_HEADER side,'); sys.stdout.flush()
++    sys.stdout.write(header[len('side,'):] + '\n'); sys.stdout.flush()
++else:
++    out('BW_CSV_HEADER ' + header)
++out('BW_RESULT ' + result)
++out('BW_CSV ' + row)
++if mode == 'two-rows':
++    values[1] = '1'
++    extra_row = ','.join(values)
++    extra_result = ' '.join(key + '=' + value for key, value in zip(header.split(','), values))
++    out('BW_RESULT ' + extra_result)
++    out('BW_CSV ' + extra_row)
++done_trials = 2 if mode == 'done-two' else 1
++out('BW_DONE trials=%d failed=0 cleanup=0' % done_trials)
++if mode == 'duplicate-done':
++    out('BW_DONE trials=1 failed=0 cleanup=0')
++elif mode == 'duplicate-done-no-newline':
++    sys.stdout.write('BW_DONE trials=1 failed=0 cleanup=0'); sys.stdout.flush()
++elif mode == 'trailing-no-newline':
++    sys.stdout.write('TRAILING_AFTER_DONE'); sys.stdout.flush()
+ '''
+
+
+ class RelayTests(unittest.TestCase):
+-    def fake(self, host, role, gid, log):
+-        process = run_bw.subprocess.Popen([os.sys.executable, '-u', '-c', FAKE_ENDPOINT, role, gid],
++    def fake(self, host, role, gid, log, mode='valid'):
++        process = run_bw.subprocess.Popen([os.sys.executable, '-u', '-c', FAKE_ENDPOINT, role, gid, mode],
+                                           stdin=run_bw.subprocess.PIPE, stdout=run_bw.subprocess.PIPE,
+                                           stderr=run_bw.subprocess.PIPE)
+         with patch.object(run_bw.cross.subprocess, 'Popen', return_value=process):
+             endpoint = run_bw.cross.Endpoint(host, ['unused'], log)
+-        self.addCleanup(lambda: process.poll() is None and process.kill())
++        def cleanup():
++            if process.poll() is None:
++                process.terminate()
++                process.wait(timeout=3)
++        self.addCleanup(cleanup)
+         return endpoint
+
+     def test_relay_holds_endpoints_then_forwards_and_collects_rows(self):
+@@ -269,19 +417,162 @@ class RelayTests(unittest.TestCase):
+             for endpoint, payload in held.items():
+                 seen[endpoint.host] = run_bw.descriptor(payload)[1]
+
+-        relay = run_bw.Relay([mac, peer], log, run_bw.time.monotonic() + 20, on_endpoints)
++        relay = run_bw.Relay([mac, peer], log, run_bw.time.monotonic() + 20, on_endpoints, 0, 1)
+         with patch('builtins.print'):
+             relay.run()
+             self.assertEqual(mac.stop(), 0)
+             self.assertEqual(peer.stop(), 0)
+         self.assertEqual(seen, {'mac-test': '02:00:00:00:00:01', 'linux-test': '02:00:00:00:00:02'})
+-        self.assertEqual(relay.header, 'side,trial')
+-        self.assertEqual(relay.rows[mac], ['initiator,0'])
+-        self.assertEqual(relay.rows[peer], ['responder,0'])
++        self.assertEqual(relay.header, ','.join(run_bw.RESULT_FIELDS))
++        for endpoint, role, source in ((mac, 'initiator', 'peer'), (peer, 'responder', 'local')):
++            self.assertEqual(len(relay.rows[endpoint]), 1)
++            values = dict(zip(run_bw.RESULT_FIELDS, relay.rows[endpoint][0].split(',')))
++            self.assertEqual(values['side'], role)
++            self.assertEqual(values['verified_bytes'], '1048576')
++            self.assertEqual(values['mismatches'], '0')
++            self.assertEqual(values['guard_ok'], '1')
++            self.assertEqual(values['verification_source'], source)
++            self.assertEqual(values['verification_receiver'], 'responder')
+         self.assertEqual(relay.errors, [])
+         self.assertEqual(relay.done, {mac, peer})
++        self.assertTrue(relay.verify_complete)
+         self.assertTrue(any(entry.get('response', '').startswith('BW_RESULT side=initiator') for entry in log))
+
++    def test_relay_forwards_both_final_acks_before_closing_both_inputs(self):
++        log, events = [], []
++        mac = self.fake('mac-test', 'initiator', 'fe80::ff:fe00:1', log)
++        peer = self.fake('linux-test', 'responder', 'fe80::ff:fe00:2', log)
++
++        class RecordedInput:
++            def __init__(self, host, stream):
++                self.host, self.stream = host, stream
++
++            def write(self, data):
++                events.append(('send', self.host, data.decode().strip()))
++                return self.stream.write(data)
++
++            def flush(self):
++                return self.stream.flush()
++
++            def close(self):
++                events.append(('close', self.host, ''))
++                return self.stream.close()
++
++            def __getattr__(self, name):
++                return getattr(self.stream, name)
++
++        for endpoint in (mac, peer):
++            endpoint.process.stdin = RecordedInput(endpoint.host, endpoint.process.stdin)
++        relay = run_bw.Relay([mac, peer], log, run_bw.time.monotonic() + 20, lambda held: None, 0, 1)
++        with patch('builtins.print'):
++            relay.run()
++        first_close = next(index for index, event in enumerate(events) if event[0] == 'close')
++        confirm = next(index for index, event in enumerate(events)
++                       if event[:2] == ('send', peer.host) and event[2].startswith('CONFIRM '))
++        confirmed = next(index for index, event in enumerate(events)
++                         if event[:2] == ('send', mac.host) and event[2].startswith('CONFIRMED '))
++        self.assertLess(confirm, confirmed)
++        self.assertLess(confirmed, first_close)
++        self.assertEqual({event[1] for event in events if event[0] == 'close'}, {'mac-test', 'linux-test'})
++        self.assertTrue(relay.inputs_closed)
++        relay.close_inputs()
++        self.assertEqual(sum(event[0] == 'close' for event in events), 2)
++        responses = [entry.get('response', '') for entry in log]
++        self.assertLess(next(i for i, value in enumerate(responses) if value.startswith('BW_MSG CONFIRMED ')),
++                        next(i for i, value in enumerate(responses) if value.startswith('BW_RESULT ')))
++        with patch('builtins.print'):
++            self.assertEqual(mac.stop(), 0)
++            self.assertEqual(peer.stop(), 0)
++
++    def test_relay_close_or_flush_failure_is_fatal_and_cleanup_preserves_the_original(self):
++        class FailingInput:
++            def __init__(self, stream, failures):
++                self.stream, self.failures = stream, list(failures)
++                self.closing = False
++
++            def close(self):
++                if self.stream.closed:
++                    return self.stream.close()
++                if self.failures and self.failures[0][0] == 'close':
++                    raise OSError(self.failures.pop(0)[1])
++                self.closing = True
++                try:
++                    self.flush()
++                    return self.stream.close()
++                finally:
++                    self.closing = False
++
++            def flush(self):
++                if self.closing and self.failures and self.failures[0][0] == 'flush':
++                    raise OSError(self.failures.pop(0)[1])
++                return self.stream.flush()
++
++            def __getattr__(self, name):
++                return getattr(self.stream, name)
++
++        cases = (((('close', 'strict-close'),), 'strict-close', False),
++                 ((('flush', 'strict-flush'), ('close', 'cleanup-close')), 'strict-flush', True))
++        for failures, original_error, cleanup_fails in cases:
++            with self.subTest(failures=failures):
++                log = []
++                mac = self.fake('mac-test', 'initiator', 'fe80::ff:fe00:1', log)
++                peer = self.fake('linux-test', 'responder', 'fe80::ff:fe00:2', log)
++                raw = peer.process.stdin
++                peer.process.stdin = FailingInput(raw, failures)
++                relay = run_bw.Relay([mac, peer], log, run_bw.time.monotonic() + 20, lambda held: None, 0, 1)
++                with patch('builtins.print'), self.assertRaisesRegex(RuntimeError, original_error):
++                    relay.run()
++                self.assertFalse(relay.inputs_closed)
++                self.assertIn(mac, relay.closed_inputs)
++                if cleanup_fails:
++                    self.assertNotIn(peer, relay.closed_inputs)
++                    self.assertTrue(any('cleanup-close' in error for error in relay.input_close_errors))
++                    self.assertTrue(any('cleanup-close' in entry.get('input_close_error', '') for entry in log))
++                    peer.process.stdin = raw
++                    raw.close()
++                else:
++                    self.assertIn(peer, relay.closed_inputs)
++                    self.assertEqual(relay.input_close_errors, [])
++                with patch('builtins.print'):
++                    mac.stop()
++                    peer.stop()
++
++    def test_relay_timeout_closes_inputs_before_endpoint_stop(self):
++        log = []
++        mac = self.fake('mac-test', 'initiator', 'fe80::ff:fe00:1', log, 'stall')
++        peer = self.fake('linux-test', 'responder', 'fe80::ff:fe00:2', log, 'stall')
++        relay = run_bw.Relay([mac, peer], log, run_bw.time.monotonic() + .2, lambda held: None, 0, 1)
++        started = run_bw.time.monotonic()
++        with patch('builtins.print'), self.assertRaisesRegex(RuntimeError, 'benchmark pair timeout'):
++            relay.run()
++        self.assertFalse(relay.inputs_closed)
++        self.assertEqual(relay.closed_inputs, {mac, peer})
++        with patch('builtins.print'):
++            self.assertEqual(mac.stop(), 0)
++            self.assertEqual(peer.stop(), 0)
++        self.assertLess(run_bw.time.monotonic() - started, 3)
++
++    def test_actual_relay_rejects_old_missing_and_mismatched_v3_before_forwarding(self):
++        cases = (('v2', 'valid', 'Invalid endpoint bounds'),
++                 ('missing', 'valid', 'Incomplete or unexpected endpoint fields'),
++                 ('valid', 'endpoint-mismatch', 'Endpoint configuration mismatch'),
++                 ('valid', 'verify-mismatch', 'Verification budget mismatch'))
++        for mac_mode, peer_mode, message in cases:
++            with self.subTest(mac_mode=mac_mode, peer_mode=peer_mode):
++                log = []
++                mac = self.fake('mac-test', 'initiator', 'fe80::ff:fe00:1', log, mac_mode)
++                peer = self.fake('linux-test', 'responder', 'fe80::ff:fe00:2', log, peer_mode)
++                relay = run_bw.Relay([mac, peer], log, run_bw.time.monotonic() + 20, lambda held: None, 0, 1)
++                with patch('builtins.print'), self.assertRaisesRegex(ValueError, message):
++                    relay.run()
++                with patch('builtins.print'):
++                    mac.stop()
++                    peer.stop()
++                stderr = ''.join(entry.get('endpoint_stderr', '') for entry in log)
++                self.assertNotIn('DATA_PHASE', stderr)
++                if 'verify-mismatch' not in (mac_mode, peer_mode):
++                    self.assertNotIn('FORWARDED_ENDPOINT', stderr)
++
+     def test_relay_stops_when_neighbour_check_fails(self):
+         log = []
+         mac = self.fake('mac-test', 'initiator', 'fe80::ff:fe00:1', log)
+@@ -290,13 +581,144 @@ class RelayTests(unittest.TestCase):
+         def refuse(_held):
+             raise RuntimeError('Mac needs the peer static IPv6 neighbour before QP connection')
+
+-        relay = run_bw.Relay([mac, peer], log, run_bw.time.monotonic() + 20, refuse)
++        relay = run_bw.Relay([mac, peer], log, run_bw.time.monotonic() + 20, refuse, 0, 1)
+         with patch('builtins.print'), self.assertRaisesRegex(RuntimeError, 'neighbour'):
+             relay.run()
+         with patch('builtins.print'):
+             mac.stop()
+             peer.stop()
+         self.assertEqual(relay.rows[mac], [])
++        self.assertEqual(relay.closed_inputs, {mac, peer})
++
++
++class RunnerRelayTests(unittest.TestCase):
++    """Exercise main -> native Endpoint -> Relay using only local subprocesses."""
++
++    def run_main(self, mac_mode='valid', peer_mode='valid', planned_size='65536'):
++        processes = []
++        original_endpoint = run_bw.cross.Endpoint
++
++        def endpoint(host, command, log):
++            role = command[command.index('--role') + 1]
++            gid = 'fe80::ff:fe00:1' if host == 'mac-test' else 'fe80::ff:fe00:2'
++            mode = mac_mode if host == 'mac-test' else peer_mode
++            process = REAL_POPEN([os.sys.executable, '-u', '-c', FAKE_ENDPOINT, role, gid, mode],
++                                 stdin=run_bw.subprocess.PIPE, stdout=run_bw.subprocess.PIPE,
++                                 stderr=run_bw.subprocess.PIPE)
++            processes.append(process)
++            with patch.object(run_bw.cross.subprocess, 'Popen', return_value=process):
++                return original_endpoint(host, command, log)
++
++        def remote(command, **_kwargs):
++            target = command[-1]
++            stdout = ''
++            if 'gid_attrs/types/' in target:
++                stdout = 'RoCE v2\n'
++            elif 'gid_attrs/ndevs/' in target:
++                stdout = 'enp9s0\n'
++            elif 'sha256sum ' in target or 'shasum -a 256 ' in target:
++                stdout = 'a' * 64 + '  fixture\n'
++            elif target.startswith('ndp -n '):
++                stdout = 'fe80::ff:fe00:2 02:00:00:00:00:02 mcrdma9 permanent R\n'
++            elif target.startswith("ip -6 neigh show to "):
++                stdout = 'fe80::ff:fe00:1 dev enp9s0 lladdr 02:00:00:00:00:01 PERMANENT\n'
++            return Mock(returncode=0, stdout=stdout, stderr='')
++
++        try:
++            with tempfile.TemporaryDirectory() as directory, \
++                    patch.object(run_bw.cross, 'Endpoint', endpoint), \
++                    patch.object(run_bw.subprocess, 'run', remote), \
++                    patch('builtins.print'):
++                output = Path(directory) / 'sweep'
++                code = run_bw.main(BASE_ARGS + ['--ops', 'write', '--sizes', planned_size, '--depths', '16',
++                                                '--qps', '1', '--initiators', 'mac', '--repeats', '1',
++                                                '--warmup', '0', '--total', '67108864', '--mtu', '1024',
++                                                '--finish', 'flag', '--verify-bytes', '1048576',
++                                                '--output', str(output)])
++                manifest = json.loads((output / 'manifest.json').read_text())
++                csv_files = list(output.glob('*.csv'))
++            return code, manifest, csv_files
++        finally:
++            for process in processes:
++                if process.poll() is None:
++                    process.terminate()
++                    process.wait(timeout=3)
++
++    def test_main_forwards_complete_v3_and_writes_result(self):
++        for mode in ('valid', 'split-ascii'):
++            with self.subTest(mode=mode):
++                code, manifest, csv_files = self.run_main(mode, mode)
++                self.assertEqual(code, 0)
++                self.assertEqual(manifest['runs'][0]['errors'], [])
++                self.assertEqual(len(csv_files), 1)
++
++    def test_main_blocks_incompatible_protocol_before_data(self):
++        cases = (('v2', 'valid', 'Invalid endpoint bounds'),
++                 ('missing', 'valid', 'Incomplete or unexpected endpoint fields'),
++                 ('valid', 'endpoint-mismatch', 'Endpoint configuration mismatch'),
++                 ('valid', 'verify-mismatch', 'Verification budget mismatch'))
++        for mac_mode, peer_mode, expected in cases:
++            with self.subTest(mac_mode=mac_mode, peer_mode=peer_mode):
++                code, manifest, csv_files = self.run_main(mac_mode, peer_mode)
++                self.assertEqual(code, 1)
++                self.assertIn(expected, ' '.join(manifest['runs'][0]['errors']))
++                self.assertEqual(csv_files, [])
++
++    def test_main_rejects_valid_pair_that_differs_from_planned_command(self):
++        code, manifest, csv_files = self.run_main(planned_size='4096')
++        self.assertEqual(code, 1)
++        self.assertIn('does not match the planned command', ' '.join(manifest['runs'][0]['errors']))
++        self.assertEqual(csv_files, [])
++
++    def test_main_rejects_lying_receiver_proof_rows_without_csv(self):
++        cases = (('lying-proof', 'receiver-proof role, direction, or shape mismatch'),
++                 ('wrong-side', 'receiver-proof role, direction, or shape mismatch'),
++                 ('wrong-direction', 'receiver-proof role, direction, or shape mismatch'),
++                 ('wrong-trial', 'contradicts planned trial or warmup'))
++        for mode, expected in cases:
++            with self.subTest(mode=mode):
++                code, manifest, csv_files = self.run_main(mode, mode)
++                self.assertEqual(code, 1)
++                self.assertIn(expected, ' '.join(manifest['runs'][0]['errors']))
++                self.assertEqual(csv_files, [])
++
++    def test_main_binds_rows_and_done_to_planned_trial_contract(self):
++        cases = (('warmup-one', 'contradicts planned trial or warmup'),
++                 ('two-rows', 'contradicts planned trial or warmup'),
++                 ('done-two', 'unsuccessful or malformed BW_DONE'))
++        for mode, expected in cases:
++            with self.subTest(mode=mode):
++                code, manifest, csv_files = self.run_main(mode, mode)
++                self.assertEqual(code, 1)
++                self.assertIn(expected, ' '.join(manifest['runs'][0]['errors']))
++                self.assertEqual(csv_files, [])
++
++    def test_main_rejects_unplanned_or_impossible_matching_fields(self):
++        cases = (('alternate-psn', 'does not match the planned command'),
++                 ('cqe-low', 'CQ capacity contradicts depth'))
++        for mode, expected in cases:
++            with self.subTest(mode=mode):
++                code, manifest, csv_files = self.run_main(mode, mode)
++                self.assertEqual(code, 1)
++                self.assertIn(expected, ' '.join(manifest['runs'][0]['errors']))
++                self.assertEqual(csv_files, [])
++
++    def test_main_rejects_premature_or_incomplete_success_output(self):
++        cases = (('premature', 'Premature CSV header'),
++                 ('incomplete', 'Incomplete bandwidth protocol'),
++                 ('csv-before-header', 'CSV row preceded its header'),
++                 ('confirmed-extra-message', 'Protocol message followed the final input close'),
++                 ('confirmed-extra-partial', 'Protocol message followed the final input close'),
++                 ('duplicate-done', 'output followed BW_DONE'),
++                 ('duplicate-done-no-newline', 'truncated endpoint output at EOF'),
++                 ('trailing-no-newline', 'truncated endpoint output at EOF'),
++                 ('non-ascii-split', 'not ASCII protocol text'))
++        for mode, expected in cases:
++            with self.subTest(mode=mode):
++                code, manifest, csv_files = self.run_main(mode, mode)
++                self.assertEqual(code, 1)
++                self.assertIn(expected, ' '.join(manifest['runs'][0]['errors']))
++                self.assertEqual(csv_files, [])
+
+
+ class SummaryTests(unittest.TestCase):
+diff --git a/tests/test_verify_receiver.py b/tests/test_verify_receiver.py
+new file mode 100644
+index 0000000..0b08ffa
+--- /dev/null
++++ b/tests/test_verify_receiver.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++import pathlib
++import shutil
++import subprocess
++import sys
++import tempfile
++import unittest
++
++ROOT=pathlib.Path(__file__).resolve().parents[1]
++
++class VerifyReceiverTest(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        compiler=shutil.which("clang") or shutil.which("cc")
++        if not compiler:
++            raise unittest.SkipTest("C compiler required")
++        cls.temp=tempfile.TemporaryDirectory()
++        cls.binary=pathlib.Path(cls.temp.name)/"receiver"
++        subprocess.run([compiler,"-std=c11","-D_POSIX_C_SOURCE=200809L","-D_DARWIN_C_SOURCE",
++                        "-O1","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",
++                        str(ROOT/"tests/verify_receiver_fixture.c"),
++                        "-lrdma" if sys.platform=="darwin" else "-libverbs",
++                        "-o",str(cls.binary)],check=True)
++
++    @classmethod
++    def tearDownClass(cls): cls.temp.cleanup()
++
++    def test_read_and_write_receivers_accept_and_reject(self):
++        for operation,role in (("read","initiator"),("write","responder")):
++            good=subprocess.run([str(self.binary),operation,"good"],text=True,capture_output=True)
++            self.assertEqual(good.returncode,0,good.stdout+good.stderr)
++            self.assertIn(f"role={role}",good.stdout)
++            self.assertIn("verified=4096 mismatches=0",good.stdout)
++            bad=subprocess.run([str(self.binary),operation,"corrupt"],text=True,capture_output=True)
++            self.assertEqual(bad.returncode,3,bad.stdout+bad.stderr)
++            self.assertRegex(bad.stdout,r"mismatches=[1-9][0-9]*")
++
++if __name__=="__main__": unittest.main(verbosity=2)
+diff --git a/tests/test_verify_windows.py b/tests/test_verify_windows.py
+new file mode 100644
+index 0000000..49252e7
+--- /dev/null
++++ b/tests/test_verify_windows.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++import re
++import subprocess
++import tempfile
++import unittest
++from pathlib import Path
++
++
++ROOT = Path(__file__).resolve().parents[1]
++SOURCE = ROOT / "tests/verify_windows_fixture.c"
++
++
++class VerifyWindowsTest(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.temp = tempfile.TemporaryDirectory()
++        cls.binary = Path(cls.temp.name) / "fixture"
++        subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
++                        str(SOURCE), "-o", str(cls.binary)], check=True)
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.temp.cleanup()
++
++    def run_args(self, *args, ok=True):
++        result = subprocess.run([str(self.binary), *(str(value) for value in args)],
++                                text=True, capture_output=True)
++        self.assertEqual(result.returncode, 0 if ok else 1, result)
++        return result.stdout
++
++    def run_fixture(self, slot_bytes, slots, verify, ok=True):
++        return self.run_args(slot_bytes, slots, verify, ok=ok)
++
++    def windows(self, slot_bytes, slots, verify):
++        output = self.run_fixture(slot_bytes, slots, verify)
++        windows = [(int(a), int(b)) for a, b in
++                   re.findall(r"offset=(\d+) length=(\d+)", output)]
++        total = re.search(r"TOTAL count=(\d+) bytes=(\d+)", output)
++        self.assertIsNotNone(total)
++        self.assertEqual(int(total.group(1)), len(windows))
++        self.assertEqual(int(total.group(2)), verify)
++        return windows, output
++
++    def assert_contract(self, slot_bytes, slots, verify):
++        windows, _ = self.windows(slot_bytes, slots, verify)
++        self.assertEqual(sum(length for _, length in windows), verify)
++        self.assertEqual(len(windows), len(set(windows)))
++        previous = 0
++        for index, (offset, length) in enumerate(windows):
++            self.assertEqual(offset % 8, 0)
++            self.assertEqual(length % 8, 0)
++            self.assertGreater(length, 0)
++            self.assertLessEqual(offset + length, slot_bytes * slots)
++            if index:
++                self.assertGreaterEqual(offset, previous)
++            self.assertEqual(offset // slot_bytes, (offset + length - 1) // slot_bytes)
++            previous = offset + length
++        return windows
++
++    def test_zero_is_rejected(self):
++        self.assertIn("verify_bytes_invalid_alignment_or_minimum",
++                      self.run_fixture(4096, 1, 0, ok=False))
++
++    def test_auto_budget_is_bounded_by_capacity(self):
++        self.assertIn("bytes=1048576", self.run_args("effective", 65536, 64, 0, 0))
++        self.assertIn("bytes=4096", self.run_args("effective", 4096, 1, 0, 0))
++
++    def test_default_shape_one_mib_is_exact(self):
++        self.assert_contract(65536, 16, 1 << 20)
++
++    def test_small_semantics(self):
++        for capacity, requested in ((8, 8), (16, 8), (16, 16), (4096, 8), (4096, 16)):
++            self.assertIn("verify_bytes_invalid_alignment_or_minimum",
++                          self.run_fixture(capacity, 1, requested, ok=False))
++        self.assertIn("verify_bytes_invalid_alignment_or_minimum",
++                      self.run_args("effective", 8, 1, 0, 0, ok=False))
++        self.assertEqual(sum(length for _, length in self.assert_contract(4096, 1, 24)), 24)
++
++    def test_non_multiple_is_rejected(self):
++        self.assertIn("verify_bytes_invalid_alignment_or_minimum",
++                      self.run_fixture(4096, 1, 15, ok=False))
++
++    def test_exact_p06_one_mib_has_first_middle_last(self):
++        windows = self.assert_contract(4 << 20, 1, 1 << 20)
++        self.assertEqual(len(windows), 3)
++        self.assertEqual(windows[0][0], 0)
++        self.assertLess(windows[0][0] + windows[0][1], windows[1][0])
++        self.assertLess(windows[1][0] + windows[1][1], windows[2][0])
++        self.assertEqual(windows[2][0] + windows[2][1], 4 << 20)
++        middle = windows[1][0] + windows[1][1] // 2
++        self.assertLessEqual(abs(middle - (2 << 20)), 8)
++
++    def test_capacity_boundary(self):
++        windows = self.assert_contract(4096, 3, 3 * 4096)
++        self.assertEqual(windows[0][0], 0)
++        self.assertEqual(windows[-1][0] + windows[-1][1], 3 * 4096)
++
++    def test_over_capacity_is_rejected(self):
++        self.assertIn("verify_bytes_exceed_transfer_slots",
++                      self.run_fixture(4096, 2, 8192 + 8, ok=False))
++
++    def test_deterministic_and_distributes_remaining_sample(self):
++        first, output = self.windows(4096, 4, 4096 + 24)
++        second, repeated = self.windows(4096, 4, 4096 + 24)
++        self.assertEqual(output, repeated)
++        self.assertEqual(first, second)
++        self.assertEqual(sum(length for _, length in first), 4096 + 24)
++
++    def test_arithmetic_overflow_is_rejected(self):
++        self.assertIn("verify_window_arithmetic_or_representation_overflow",
++                      self.run_fixture((1 << 64) - 8, 2, 8, ok=False))
++
++    def test_allocation_failure_is_reported(self):
++        self.assertIn("verify_windows_alloc",
++                      self.run_args("allocfail", 4096, 2, 4096, ok=False))
++
++    def test_protocol_version_and_budget_must_match(self):
++        good=(3, 0, 0, 1, 1, 1048576, 1048576)
++        self.assertIn("match=1",self.run_args("protocol",*good))
++        for index, value in ((0,1),(2,1),(4,0),(6,1048568)):
++            bad=list(good); bad[index]=value
++            self.assertIn("match=0",self.run_args("protocol",*bad,ok=False))
++
++    def test_capacity_edges_and_slot_boundary_split(self):
++        for requested in (24, 4096, 4096+8, 8192):
++            windows=self.assert_contract(4096,2,requested)
++            self.assertLessEqual(len(windows),6)
++        self.assertIn("verify_bytes_exceed_transfer_slots",
++                      self.run_fixture(4096,2,8200,ok=False))
++
++    def test_global_first_middle_last_for_minimum_budget(self):
++        for slots in (2, 3, 32):
++            windows=self.assert_contract(4096,slots,24)
++            capacity=4096*slots
++            self.assertEqual(windows[0][0],0)
++            self.assertEqual(windows[-1][0]+windows[-1][1],capacity)
++            midpoint=capacity//2
++            self.assertTrue(any(offset <= midpoint < offset+length for offset,length in windows),windows)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/verify_receiver_fixture.c b/tests/verify_receiver_fixture.c
+new file mode 100644
+index 0000000..27b76e7
+--- /dev/null
++++ b/tests/verify_receiver_fixture.c
+@@ -0,0 +1,29 @@
++#include <infiniband/verbs.h>
++#include <assert.h>
++#include <string.h>
++
++#define main benchmark_main
++#include "../benchmarks/mcdma_bw.c"
++#undef main
++
++int main(int argc,char **argv) {
++    assert(argc==3);
++    struct bench b={0};
++    b.o.op=!strcmp(argv[1],"read") ? OP_READ : OP_WRITE;
++    assert(b.o.op==OP_READ || !strcmp(argv[1],"write"));
++    b.o.initiator=b.o.op==OP_READ;
++    b.o.bytes=4096; b.o.qps=1; b.depth_local=b.depth=4;
++    b.o.verify_explicit=1; b.o.verify_bytes=4096; b.nonce=UINT64_C(0x123456789);
++    b.region_bytes=4*4096+GUARD_BYTES+FLAG_BYTES;
++    b.region=malloc((size_t)b.region_bytes); assert(b.region);
++    memset(b.region,0x5a,(size_t)b.region_bytes);
++    build_windows(&b); fill_slots(&b,0);
++    assert(b.window_count && b.verify_effective==4096);
++    if (!strcmp(argv[2],"corrupt")) b.region[b.windows[b.window_count/2].offset]^=1;
++    else assert(!strcmp(argv[2],"good"));
++    uint64_t verified=0, mismatches=verify_windows(&b,0,&verified);
++    printf("RECEIVER op=%s role=%s verified=%" PRIu64 " mismatches=%" PRIu64 "\n",
++           argv[1],b.o.initiator?"initiator":"responder",verified,mismatches);
++    free(b.windows); free(b.region);
++    return mismatches ? 3 : 0;
++}
+diff --git a/tests/verify_windows_fixture.c b/tests/verify_windows_fixture.c
+new file mode 100644
+index 0000000..7f8c223
+--- /dev/null
++++ b/tests/verify_windows_fixture.c
+@@ -0,0 +1,53 @@
++#include <inttypes.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../benchmarks/verify_windows.h"
++
++static uint64_t number(const char *text) {
++    char *end=NULL;
++    unsigned long long value=strtoull(text,&end,10);
++    if (end==text || *end) { fprintf(stderr,"bad number\n"); exit(2); }
++    return (uint64_t)value;
++}
++static void *fail_allocate(size_t count,size_t size) { (void)count; (void)size; return NULL; }
++
++int main(int argc,char **argv) {
++    if (argc==6 && !strcmp(argv[1],"effective")) {
++        uint64_t effective=0;
++        enum mcdma_verify_window_error error=mcdma_verify_effective_budget(
++            number(argv[2]),number(argv[3]),number(argv[4]),(int)number(argv[5]),&effective);
++        if (error!=MCDMA_VERIFY_OK) { printf("ERROR %s\n",mcdma_verify_window_error_name(error)); return 1; }
++        printf("EFFECTIVE bytes=%" PRIu64 "\n",effective); return 0;
++    }
++    if (argc==9 && !strcmp(argv[1],"protocol")) {
++        const int match=mcdma_verify_protocol_matches(number(argv[2]),(unsigned)number(argv[3]),(unsigned)number(argv[4]),
++                                                       (unsigned)number(argv[5]),(unsigned)number(argv[6]),number(argv[7]),number(argv[8]));
++        printf("PROTOCOL match=%d\n",match); return match ? 0 : 1;
++    }
++    const int fail_alloc=argc==5 && !strcmp(argv[1],"allocfail");
++    const int first=fail_alloc ? 2 : 1;
++    if ((!fail_alloc && argc!=4) || (fail_alloc && argc!=5)) {
++        fprintf(stderr,"usage: fixture [allocfail] SLOT_BYTES SLOTS VERIFY_BYTES\n"); return 2;
++    }
++    struct mcdma_verify_window *windows=NULL; size_t count=0;
++    enum mcdma_verify_window_error error=fail_alloc ?
++        mcdma_build_verify_windows_alloc(number(argv[first]),number(argv[first+1]),number(argv[first+2]),
++                                         &windows,&count,fail_allocate) :
++        mcdma_build_verify_windows(number(argv[first]),number(argv[first+1]),number(argv[first+2]),
++                                   &windows,&count);
++    if (error!=MCDMA_VERIFY_OK) {
++        printf("ERROR %s\n",mcdma_verify_window_error_name(error));
++        return 1;
++    }
++    uint64_t sum=0;
++    for (size_t i=0;i<count;++i) {
++        printf("WINDOW %zu offset=%" PRIu64 " length=%" PRIu64 "\n",i,windows[i].offset,windows[i].length);
++        sum+=windows[i].length;
++    }
++    printf("TOTAL count=%zu bytes=%" PRIu64 "\n",count,sum);
++    free(windows);
++    return 0;
++}

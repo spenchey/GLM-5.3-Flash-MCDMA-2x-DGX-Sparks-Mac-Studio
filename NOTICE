@@ -1,0 +1,79 @@
+GLM-5.3 Flash MCDMA two-Spark plus Mac Studio recipe
+Copyright 2026 Spencer Heywood and contributors
+
+This repository's original code, scripts, tests, and documentation are
+licensed under the Apache License, Version 2.0. Redistribution must retain this
+NOTICE and describe material changes.
+
+This repository builds on third-party work that keeps its own license:
+
+TensorFold
+  https://github.com/ashhart/TensorFold
+  Copyright 2026 TensorFold contributors.
+  Apache License, Version 2.0. Code originating before TensorFold 0.6.0 also
+  retains the following MIT notice. The patch in patches/tensorfold modifies
+  TensorFold source; its diff context and upstream code remain under those
+  TensorFold licenses.
+
+    Copyright (c) 2026 TensorFold contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+MCDMA
+  https://github.com/ashhart/MCDMA
+  Copyright 2026 MCDMA contributors.
+  Apache License, Version 2.0. The patches in patches/mcdma modify MCDMA
+  source; their diff context and upstream code remain under MCDMA's license.
+
+Mia's AI Lab GLM-5.3 Flash TensorFold recipe
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  Copyright 2026 MiaAI-Lab.
+  Apache License, Version 2.0. This recipe uses MiaAI-Lab's pinned two-Spark
+  image, patch stack, and preparation design. See that repository's NOTICE and
+  CREDITS.md for its complete third-party attribution chain.
+
+oMLX
+  https://github.com/jundot/omlx
+  Copyright 2025 oMLX contributors.
+  Apache License, Version 2.0. Used as a design reference; oMLX source is not
+  redistributed in this repository.
+
+OpenResearch and autoresearch
+  https://github.com/alphaXIV/OpenResearch (MIT, Copyright 2026 alphaXiv)
+  https://github.com/karpathy/autoresearch (MIT, Andrej Karpathy)
+  Used as external research tooling or methodology; their source is not
+  redistributed in this repository.
+
+Model files are downloaded separately and are not included in this repository.
+Their own licenses govern their use:
+
+  - zai-org/GLM-5.3-Flash: MIT.
+  - TensorFold/GLM-5.3-Flash-MLX-4bit-MTP: MIT.
+  - incoai/GLM-5.3-Flash-DFlash2: CC BY-NC-ND 4.0.
+  - Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw, a mirror of Brandon
+    M. Music's quantization, carries the ShapleyMcg License 1.0 and requires
+    this attribution:
+
+    This work includes or was produced using ShapleyMcg, created by Brandon M.
+    Music (https://github.com/brandonmmusic-max/shapleymcg). ShapleyMcg is
+    licensed under the ShapleyMcg License v1.0, an attribution-required license
+    that grants no rights to the person known as "0xSero." Use of ShapleyMcg
+    without this attribution is unlicensed.
+
+See CREDITS.md for linked acknowledgements and upstream runtime dependencies.

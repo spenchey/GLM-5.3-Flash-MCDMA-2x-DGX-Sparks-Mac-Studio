@@ -1,0 +1,5 @@
+#!/bin/sh
+# GCC 13's fortified snprintf analysis treats peer.name as the size of the
+# enclosing struct and reports a false truncation warning. Keep every upstream
+# warning enabled and suppress only that diagnostic for the pinned offline test.
+exec /usr/bin/cc -Wno-format-truncation "$@"

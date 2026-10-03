@@ -1,0 +1,72 @@
+--- a/tensorfold/families/glm5_next/linear.py
++++ b/tensorfold/families/glm5_next/linear.py
+@@ -38,9 +38,13 @@
+                                    bits=self.bits).astype(x.dtype)
+ 
+     @classmethod
+-    def stack(cls, parts: list["Q"]) -> "Q | QSplit":
++    def stack(cls, parts: list["Q | Dense"]) -> "Q | QSplit | Dense":
+         """Projections of one input as one matrix (rows concatenated); parts of different formats stay separate."""
+ 
++        if all(isinstance(p, Dense) for p in parts):
++            return Dense(mx.concatenate([p.weight for p in parts]))
++        if any(isinstance(p, Dense) for p in parts):
++            raise ValueError("one stacked projection cannot mix dense and affine-quantized weights")
+         if len({(p.bits, p.group) for p in parts}) > 1:
+             return QSplit(parts)
+         bits, group = one_format(parts)
+--- a/tensorfold/families/glm5_next/weights.py
++++ b/tensorfold/families/glm5_next/weights.py
+@@ -105,9 +105,7 @@
+         # kv_b_proj as stored (vontra), or the absorbed pair the mlxlm layout keeps instead
+         names += ["kv_b_proj"] if w.has(f"{attn_prefix}.kv_b_proj.weight") else ["embed_q", "unembed_out"]
+         # indexer projections and o_proj as stored: quantised, or dense when the checkpoint keeps no scales
+-        aw: dict[str, Any] = {
+-            n: (w.linear if n.startswith("indexer.") or n == "o_proj" else w.q)(f"{attn_prefix}.{n}")
+-            for n in names}
++        aw: dict[str, Any] = {n: w.linear(f"{attn_prefix}.{n}") for n in names}
+         for n in ("q_a_layernorm", "kv_a_layernorm"):
+             aw[n] = w.get(f"{attn_prefix}.{n}.weight")
+         for n in ("indexer.k_norm.weight", "indexer.k_norm.bias", "indexer.index_kpool_compress_ape",
+@@ -120,8 +118,7 @@
+     else:
+         names = ["q_proj", "k_proj", "v_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj", "b_proj", "o_proj"]
+         # low-rank gates, beta and o_proj as stored: quantised, or dense when the checkpoint keeps no scales
+-        aw = {n: (w.q if n in ("q_proj", "k_proj", "v_proj") else w.linear)(f"{attn_prefix}.{n}")
+-              for n in names}
++        aw = {n: w.linear(f"{attn_prefix}.{n}") for n in names}
+         aw["o_norm"] = w.get(f"{attn_prefix}.o_norm.weight")
+         if w.has(f"{attn_prefix}.conv1d.weight"):                        # mlxlm: one conv over q | k | v
+             aw["conv1d"] = w.get(f"{attn_prefix}.conv1d.weight")
+@@ -139,8 +136,8 @@
+     if w.has(f"{m}.gate.weight"):
+         shared = None
+         if w.has(f"{m}.shared_experts.gate_proj.weight"):
+-            shared = DenseMLP(w.q(f"{m}.shared_experts.gate_proj"), w.q(f"{m}.shared_experts.up_proj"),
+-                              w.q(f"{m}.shared_experts.down_proj"), cfg.swiglu_limit)
++            shared = DenseMLP(w.linear(f"{m}.shared_experts.gate_proj"), w.linear(f"{m}.shared_experts.up_proj"),
++                              w.linear(f"{m}.shared_experts.down_proj"), cfg.swiglu_limit)
+         stacked = []
+         for proj in ("gate_proj", "up_proj", "down_proj"):
+             if stream:
+@@ -162,7 +159,8 @@
+         _materialize(mlp.router, mlp.bias, mlp.scale_arr, mlp.limit_arr, mlp.router_packed,
+                      *(mlp.shared.gate_up, mlp.shared.down) if shared else ())
+     else:
+-        mlp = DenseMLP(w.q(f"{m}.gate_proj"), w.q(f"{m}.up_proj"), w.q(f"{m}.down_proj"), cfg.swiglu_limit)
++        mlp = DenseMLP(w.linear(f"{m}.gate_proj"), w.linear(f"{m}.up_proj"),
++                       w.linear(f"{m}.down_proj"), cfg.swiglu_limit)
+         _materialize(mlp.gate_up, mlp.down)
+     in_norm = w.get(f"{p}.input_layernorm.weight")
+     post_norm = w.get(f"{p}.post_attention_layernorm.weight")
+@@ -200,8 +198,8 @@
+     w = Weights(model_dir, mtp_layer=cfg.num_hidden_layers)
+     count = cfg.num_hidden_layers if layers is None else min(int(layers), cfg.num_hidden_layers)
+     layers = [load_layer(w, i, cfg, stream=stream) for i in range(count)]
+-    embed = w.q("embed_tokens")
+-    lm_head = w.q("lm_head")
++    embed = w.linear("embed_tokens")
++    lm_head = w.linear("lm_head")
+     norm = w.get("norm.weight")
+     _materialize(embed, lm_head, norm)
+     model = GLM5(cfg, embed, layers, norm, lm_head)

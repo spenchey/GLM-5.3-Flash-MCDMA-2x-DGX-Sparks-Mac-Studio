@@ -1,0 +1,25 @@
+{
+  "base_commit": "719219272c9ce6fc091b4eab6214eac510b5e387",
+  "patch": {
+    "path": "0001-safe-benchmark-cleanup.patch",
+    "sha256": "57c5a86174920e392941fe0b1f3209377bb42954896f16c0d721769c57494839"
+  },
+  "files": {
+    "tools/native_cross_host.py": {
+      "base_sha256": "e38668dacdbedded6c4047af93f8615855bacae6b515d010f6cd0b38d330ba48",
+      "patched_sha256": "2ce10a1506dd72f44f6aa1f7fe6917c3643f8034469b16d78e1f92d0cbbeba1f"
+    },
+    "benchmarks/run_bw.py": {
+      "base_sha256": "5676178b1c6f679d2cf2bcf054f96da34edbf9b04e485f30ac124f0fffe5fbff",
+      "patched_sha256": "f5af93517e57eaf327ceefae3f9898783d695a6e3ba2554a91f906c9a044fbcf"
+    },
+    "tests/test_native_endpoint.py": {
+      "base_sha256": "0edd983fd74c964c9f90aeadd0d298f49655259fa211abb0dbd1c926b7554025",
+      "patched_sha256": "f1bb41d351a71520b51d9f950b09b314745d8f6c7a62bf266b8a4e76052fceae"
+    },
+    "tests/test_bw_tools.py": {
+      "base_sha256": "81779407f48679063a263bec2a0f06ae405bc32bee91be1b63add8f9e054e3b8",
+      "patched_sha256": "b5535c149caa87dea854a300b33274971f8930dfb8b6df826f16fa25897978ae"
+    }
+  }
+}

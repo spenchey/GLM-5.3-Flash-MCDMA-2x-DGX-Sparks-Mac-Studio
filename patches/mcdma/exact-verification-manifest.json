@@ -1,0 +1,80 @@
+{
+  "base_commit": "719219272c9ce6fc091b4eab6214eac510b5e387",
+  "patches": [
+    {
+      "path": "0001-safe-benchmark-cleanup.patch",
+      "sha256": "57c5a86174920e392941fe0b1f3209377bb42954896f16c0d721769c57494839"
+    },
+    {
+      "path": "0002-exact-verification-windows.patch",
+      "sha256": "630aeabb8bd9278e0efcf1c090355ce27d1bf09fcfffa0208c50e9b4b013059e"
+    }
+  ],
+  "files": {
+    "benchmarks/mcdma_bw.c": {
+      "base_sha256": "626a5bb018029a18c0198c9cba4fe7e61493378489f480217866e41617a1d229",
+      "after_cleanup_sha256": "626a5bb018029a18c0198c9cba4fe7e61493378489f480217866e41617a1d229",
+      "patched_sha256": "df903c648fc0db486b88c061a37eceea31c9e85788ed6e73e4ad7597c20e8943"
+    },
+    "benchmarks/run_bw.py": {
+      "base_sha256": "5676178b1c6f679d2cf2bcf054f96da34edbf9b04e485f30ac124f0fffe5fbff",
+      "after_cleanup_sha256": "f5af93517e57eaf327ceefae3f9898783d695a6e3ba2554a91f906c9a044fbcf",
+      "patched_sha256": "0f27d6cc86b0c1d628a97db3037d009c5944f0422f20ae17de420e03c06dcb5e"
+    },
+    "benchmarks/verify_windows.h": {
+      "base_sha256": null,
+      "after_cleanup_sha256": null,
+      "patched_sha256": "26731a52940927b08f905eb17462ee6c05cb0524f1b988ec31f46d8fe3f587a4"
+    },
+    "tests/test_bw_payload.py": {
+      "base_sha256": "b94c599e0ec4dc6ae03253ad2d1de7b85db54579ad7f3f565fa8e98c28fc0f1a",
+      "after_cleanup_sha256": "b94c599e0ec4dc6ae03253ad2d1de7b85db54579ad7f3f565fa8e98c28fc0f1a",
+      "patched_sha256": "43fada8d3688e3eae87b9f3f467e7bde2de641d638551dca6fd3d90306105ad9"
+    },
+    "tests/bw_pattern_trial.c": {
+      "base_sha256": null,
+      "after_cleanup_sha256": null,
+      "patched_sha256": "a0cc48ad07eb5a4307b7bed5cee6f8d83eeee6797d7d3efe27af19b55e73097c"
+    },
+    "tests/bw_payload_trial.c": {
+      "base_sha256": "8f90427b60cff39f07f2e37386ac10e871f0de7cdcc7474c80b4b70729eca3ed",
+      "after_cleanup_sha256": "8f90427b60cff39f07f2e37386ac10e871f0de7cdcc7474c80b4b70729eca3ed",
+      "patched_sha256": "5cd216dcef26afd9b78abf6fbde5cb097990125e01558d52e485165960383750"
+    },
+    "tests/test_bw_pattern_trial.py": {
+      "base_sha256": null,
+      "after_cleanup_sha256": null,
+      "patched_sha256": "f363e5aa7e0c4995072bc2a6bdcd8e297c8e08546d63d1bd375de9559cb3ca06"
+    },
+    "tests/test_bw_payload_trial.py": {
+      "base_sha256": "cf296186f332f60f86ef0c8ae7c35335971c0367250f712c2ee20963c252f749",
+      "after_cleanup_sha256": "cf296186f332f60f86ef0c8ae7c35335971c0367250f712c2ee20963c252f749",
+      "patched_sha256": "28968b6c3f65a3f7e19b68ef561c82bfbf057366c1f71a4d768fbf515fa490a8"
+    },
+    "tests/test_bw_tools.py": {
+      "base_sha256": "81779407f48679063a263bec2a0f06ae405bc32bee91be1b63add8f9e054e3b8",
+      "after_cleanup_sha256": "b5535c149caa87dea854a300b33274971f8930dfb8b6df826f16fa25897978ae",
+      "patched_sha256": "5ea4085ce1fcd6f1bfacd724d0b86301e6d76ea64df2d6f952c986497cc7181c"
+    },
+    "tests/test_verify_receiver.py": {
+      "base_sha256": null,
+      "after_cleanup_sha256": null,
+      "patched_sha256": "cb2da467304f1c0b36811c2e792e2385bfa9bbce2ef6e42dcc3d0ae07e8b5226"
+    },
+    "tests/test_verify_windows.py": {
+      "base_sha256": null,
+      "after_cleanup_sha256": null,
+      "patched_sha256": "aa1e5734bef2ece3de7186d4644cb9db57996e49a6bf89104db06db754b158f7"
+    },
+    "tests/verify_receiver_fixture.c": {
+      "base_sha256": null,
+      "after_cleanup_sha256": null,
+      "patched_sha256": "43638e38d163a39560efebd714fc261166df138f7cad833424e299ebfcaab08f"
+    },
+    "tests/verify_windows_fixture.c": {
+      "base_sha256": null,
+      "after_cleanup_sha256": null,
+      "patched_sha256": "224b482cdd23accc60cd40e5ab581fae3fd508699f9c07480c04ffe101ca575b"
+    }
+  }
+}

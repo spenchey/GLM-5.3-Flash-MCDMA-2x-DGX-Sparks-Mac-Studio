@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "baseline_id": "offline-reference-v1",
+  "settings": {
+    "batch_size": 1,
+    "transport": "tcp",
+    "window_rows": 4
+  },
+  "evaluator": {
+    "correctness_checks": [
+      "answer_hash_matches",
+      "output_shape_matches"
+    ],
+    "performance": {
+      "metric": "elapsed_ms",
+      "direction": "lower",
+      "baseline_value": 100.0,
+      "minimum_improvement": 1.0
+    }
+  }
+}
