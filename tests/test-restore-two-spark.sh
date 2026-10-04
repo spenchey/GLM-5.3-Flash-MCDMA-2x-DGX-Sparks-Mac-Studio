@@ -29,11 +29,11 @@ case "$command" in
   *"DRAFTER=mtp PREPARE=0 ./start.sh"*) exit 0 ;;
   *"docker inspect 'glm53-flash-tf'"*)
     case "${MOCK_MODE:-success}" in
-      oom) printf 'running|true|true|0|healthy|sha256:446a23697c7eba9e0434cb162b5389792c7a5ab0f2652173bf1e791e7fdb4c5d\n' ;;
-      restarted) printf 'running|true|false|1|healthy|sha256:446a23697c7eba9e0434cb162b5389792c7a5ab0f2652173bf1e791e7fdb4c5d\n' ;;
-      unhealthy) printf 'running|true|false|0|unhealthy|sha256:446a23697c7eba9e0434cb162b5389792c7a5ab0f2652173bf1e791e7fdb4c5d\n' ;;
+      oom) printf 'running|true|true|0|healthy|sha256:e97db95dd4b3f9a5ebd6ddeafb8d7d422dda729cc01b33d7f5c6ecfcf9cf2aaf\n' ;;
+      restarted) printf 'running|true|false|1|healthy|sha256:e97db95dd4b3f9a5ebd6ddeafb8d7d422dda729cc01b33d7f5c6ecfcf9cf2aaf\n' ;;
+      unhealthy) printf 'running|true|false|0|unhealthy|sha256:e97db95dd4b3f9a5ebd6ddeafb8d7d422dda729cc01b33d7f5c6ecfcf9cf2aaf\n' ;;
       wrong_image) printf 'running|true|false|0|healthy|sha256:wrong\n' ;;
-      *) printf 'running|true|false|0|healthy|sha256:446a23697c7eba9e0434cb162b5389792c7a5ab0f2652173bf1e791e7fdb4c5d\n' ;;
+      *) printf 'running|true|false|0|healthy|sha256:e97db95dd4b3f9a5ebd6ddeafb8d7d422dda729cc01b33d7f5c6ecfcf9cf2aaf\n' ;;
     esac
     ;;
   *"/v1/models"*)

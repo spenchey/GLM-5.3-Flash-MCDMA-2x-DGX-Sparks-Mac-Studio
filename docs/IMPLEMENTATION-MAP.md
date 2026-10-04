@@ -26,23 +26,25 @@
 `patches/tensorfold/0001-metal-read-exl3-dense-stage.patch` adds the narrow
 Metal-side ability to read the required EXL3 dense tensors for embedding and
 original layer 0. It does not replace TensorFold's model implementation.
+`patches/tensorfold/0002-glm-dflash2-metal.patch` adds the reviewed Mac GLM
+DFlash2 loader and verified draft-head runtime. It remains optional at launch.
 `patches/tensorfold/metal-stage-manifest.json` pins both exact input and output
 source hashes. `scripts/prepare-tensorfold-metal-stage.sh` refuses any base
-other than official TensorFold 0.6.3 at the pinned commit, applies the patch in
-a new destination, and verifies the result.
+other than official TensorFold 0.6.5 at the pinned commit, applies both patches
+in a new destination, and verifies the complete result.
 
-The deployed Spark image is Mia's pinned TensorFold 0.6.0 image with patch label
-`5e01f1bb74d8`. Both ranks verify the same image ID before startup. The Mac uses
-official TensorFold 0.6.3 in an isolated source stage and receives only the
-checked two-file EXL3 dense-stage reader patch. The asymmetric versions are
-intentional and independently pinned in `UPSTREAM.lock`.
+The deployed Spark image is Mia's pinned TensorFold 0.6.0 image with its exact
+published patch label. Both ranks verify the same image ID before startup. The
+Mac uses official TensorFold 0.6.5 in an isolated source stage with the checked
+dense-stage and GLM DFlash2 patches. The asymmetric versions are intentional
+and independently pinned in `UPSTREAM.lock`.
 
 ## Operations
 
 | Script | Responsibility |
 | --- | --- |
 | `scripts/preflight-three-machine.sh` | Verify every pinned image, model, stage, runtime and library |
-| `scripts/prepare-tensorfold-metal-stage.sh` | Materialize the exact checked Mac TensorFold source from the pinned Mia base |
+| `scripts/prepare-tensorfold-metal-stage.sh` | Materialize the exact checked Mac TensorFold source from the pinned official base |
 | `scripts/deploy-three-machine.sh` | Copy the controlled project subset to all runtime hosts |
 | `scripts/project-manifest.py` | Prove the reusable deployed file set is byte-identical on the controller and all three hosts |
 | `scripts/start-three-machine.sh` | Start MCDMA, both ranks, and the Mac API in dependency order |

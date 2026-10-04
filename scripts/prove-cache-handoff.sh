@@ -90,8 +90,14 @@ if result.get("exact_token_match") is not True:
     raise SystemExit("Spark-prefilled and Mac-prefilled output tokens differ")
 if result.get("parallel") != 4:
     raise SystemExit("the proof did not run the required four simultaneous Mac replies")
-if result.get("cached_tokens") != result.get("prompt_tokens", 0) - 1:
-    raise SystemExit("the Sparks did not prepare exactly the reusable prompt prefix")
+if result.get("cached_tokens") != result.get("prompt_tokens", 0):
+    raise SystemExit("the Sparks did not prepare the complete prompt prefix")
+if result.get("mtp_cached_tokens") != result.get("prompt_tokens", 0) - 1:
+    raise SystemExit("the Spark MTP prefix stopped at the wrong position")
+if result.get("spark_reference_first_token") is None:
+    raise SystemExit("the Spark prefill did not bind its first reply token")
+if result.get("result", {}).get("first_token_source") != "mac_head_from_spark_final_hidden":
+    raise SystemExit("the Mac did not generate the first reply token from the Spark prompt state")
 cache_bytes = result.get("cache_bytes_per_request", 0)
 if cache_bytes <= 0:
     raise SystemExit("no prompt state crossed MCDMA")

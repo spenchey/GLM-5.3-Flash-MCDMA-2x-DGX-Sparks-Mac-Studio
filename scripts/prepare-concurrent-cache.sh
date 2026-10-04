@@ -23,7 +23,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 acquire_three_machine_lifecycle_lock
 
-"$PROJECT_ROOT/scripts/start-cache-handoff.sh" \
+"$PROJECT_ROOT/scripts/start-cache-handoff.sh" --persist-bundles \
   >"$evidence/start.stdout" 2>"$evidence/start.stderr"
 started=true
 before=$(adapter peek)
@@ -82,8 +82,12 @@ worker_prefill_seconds = prefill_seconds(sys.argv[9], 1)
 digest = result.get("prompt_sha256", "")
 if result.get("event") != "glm_mcdma_decode" or not re.fullmatch(r"[0-9a-f]{64}", digest):
     raise SystemExit("cache preparation returned no verified prompt digest")
-if result.get("cached_tokens") != result.get("prompt_tokens", 0) - 1:
-    raise SystemExit("cache preparation stopped at the wrong prompt position")
+if result.get("cached_tokens") != result.get("prompt_tokens", 0):
+    raise SystemExit("cache preparation stopped before the complete prompt")
+if result.get("mtp_cached_tokens") != result.get("prompt_tokens", 0) - 1:
+    raise SystemExit("MTP cache preparation stopped at the wrong prompt position")
+if result.get("spark_reference_first_token") is None:
+    raise SystemExit("Spark prefill did not bind its first reply token")
 reference = result.get("local_reference") or {}
 completion = reference.get("tokens")
 if not isinstance(completion, list) or len(completion) != tokens:

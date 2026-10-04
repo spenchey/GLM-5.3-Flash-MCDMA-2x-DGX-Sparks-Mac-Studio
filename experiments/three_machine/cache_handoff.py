@@ -20,7 +20,7 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 CHUNK_MAGIC = b"TFCH"
 FRAME_MAGIC = b"TFFR"
 MANIFEST_MAGIC = b"TFMF"
@@ -33,7 +33,10 @@ MAX_HEADER_BYTES = 64 * 1024
 DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024
 MAX_CHUNK_BYTES = 8 * 1024 * 1024
 DEFAULT_FRAME_BYTES = 64 * 1024 * 1024
-MAX_FRAME_BYTES = 64 * 1024 * 1024
+# MCDMA supports reply halves through 256 MiB. Keep the conservative 64 MiB
+# default, but permit a complete 148 MiB GLM cache to cross in one call when
+# both peers reserve a 256 MiB reply half.
+MAX_FRAME_BYTES = 256 * 1024 * 1024
 _HEADER_LENGTH = struct.Struct(">I")
 BUNDLE_SCHEMA = 1
 BUNDLE_MANIFEST = "manifest.json"
@@ -146,9 +149,10 @@ def pack_error(exc: BaseException) -> bytes:
     return ERROR_MAGIC + message[:4096]
 
 
-def raise_if_error(raw: bytes) -> None:
-    if raw.startswith(ERROR_MAGIC):
-        raise HandoffError(raw[len(ERROR_MAGIC):].decode("utf-8", errors="replace"))
+def raise_if_error(raw: bytes | bytearray | memoryview) -> None:
+    view = memoryview(raw).cast("B")
+    if bytes(view[:len(ERROR_MAGIC)]) == ERROR_MAGIC:
+        raise HandoffError(bytes(view[len(ERROR_MAGIC):]).decode("utf-8", errors="replace"))
 
 
 def _canonical_json(value: object) -> bytes:
@@ -173,12 +177,12 @@ class TensorSpec:
     @classmethod
     def from_array(cls, name: str, value: np.ndarray, *, dtype: str | None = None) -> "TensorSpec":
         array = np.ascontiguousarray(value)
-        raw = array.tobytes()
+        raw = memoryview(array).cast("B")
         return cls(
             name=name,
             dtype=dtype or array.dtype.str,
             shape=tuple(int(n) for n in array.shape),
-            nbytes=len(raw),
+            nbytes=raw.nbytes,
             sha256=hashlib.sha256(raw).hexdigest(),
         )
 
@@ -210,6 +214,8 @@ class HandoffManifest:
     model_revision: str
     prompt_sha256: str
     cached_tokens: int
+    mtp_cached_tokens: int
+    spark_first_token: int | None
     world_size: int
     long_context: bool
     tensors: tuple[TensorSpec, ...]
@@ -223,16 +229,23 @@ class HandoffManifest:
         prompt_sha256: str,
         cached_tokens: int,
         tensors: Iterable[TensorSpec],
+        mtp_cached_tokens: int | None = None,
+        spark_first_token: int | None = None,
         world_size: int = 2,
         long_context: bool = False,
     ) -> "HandoffManifest":
         ordered = tuple(sorted(tensors, key=lambda item: item.name))
+        mtp_tokens = int(cached_tokens if mtp_cached_tokens is None else mtp_cached_tokens)
         body = {
             "protocol": PROTOCOL_VERSION,
             "model_id": model_id,
             "model_revision": model_revision,
             "prompt_sha256": prompt_sha256,
             "cached_tokens": int(cached_tokens),
+            "mtp_cached_tokens": mtp_tokens,
+            "spark_first_token": (
+                None if spark_first_token is None else int(spark_first_token)
+            ),
             "world_size": int(world_size),
             "long_context": bool(long_context),
             "tensors": [asdict(item) for item in ordered],
@@ -245,6 +258,10 @@ class HandoffManifest:
             model_revision=model_revision,
             prompt_sha256=prompt_sha256,
             cached_tokens=int(cached_tokens),
+            mtp_cached_tokens=mtp_tokens,
+            spark_first_token=(
+                None if spark_first_token is None else int(spark_first_token)
+            ),
             world_size=int(world_size),
             long_context=bool(long_context),
             tensors=ordered,
@@ -259,6 +276,8 @@ class HandoffManifest:
             "model_revision": self.model_revision,
             "prompt_sha256": self.prompt_sha256,
             "cached_tokens": self.cached_tokens,
+            "mtp_cached_tokens": self.mtp_cached_tokens,
+            "spark_first_token": self.spark_first_token,
             "world_size": self.world_size,
             "long_context": self.long_context,
             "tensors": [asdict(item) for item in self.tensors],
@@ -273,8 +292,12 @@ class HandoffManifest:
             raise HandoffError("prompt digest is invalid")
         if self.cached_tokens <= 0 or self.world_size != 2:
             raise HandoffError("cache position or Spark world size is invalid")
+        if not 0 <= self.mtp_cached_tokens <= self.cached_tokens:
+            raise HandoffError("MTP cache position is invalid")
+        if self.spark_first_token is not None and not 0 <= self.spark_first_token <= 0xFFFFFFFF:
+            raise HandoffError("Spark first token is not uint32")
         if self.long_context:
-            raise HandoffError("long-context index state is not supported by cache handoff v1")
+            raise HandoffError("long-context index state is not supported by cache handoff v2")
         names = [item.name for item in self.tensors]
         if not names or len(names) != len(set(names)) or names != sorted(names):
             raise HandoffError("tensor names must be nonempty, unique, and sorted")
@@ -291,10 +314,18 @@ class HandoffManifest:
         model_revision: str,
         prompt_sha256: str,
         cached_tokens: int,
+        mtp_cached_tokens: int | None = None,
     ) -> None:
         self.validate()
-        actual = (self.model_id, self.model_revision, self.prompt_sha256, self.cached_tokens)
-        expected = (model_id, model_revision, prompt_sha256, int(cached_tokens))
+        expected_mtp = int(cached_tokens if mtp_cached_tokens is None else mtp_cached_tokens)
+        actual = (
+            self.model_id, self.model_revision, self.prompt_sha256,
+            self.cached_tokens, self.mtp_cached_tokens,
+        )
+        expected = (
+            model_id, model_revision, prompt_sha256,
+            int(cached_tokens), expected_mtp,
+        )
         if actual != expected:
             raise HandoffError("cache model, prompt, or position differs from the decode request")
 
@@ -332,11 +363,24 @@ class TensorArchive:
         prompt_sha256: str,
         cached_tokens: int,
         dtype_names: Mapping[str, str] | None = None,
+        mtp_cached_tokens: int | None = None,
+        spark_first_token: int | None = None,
     ) -> None:
         if not arrays:
             raise HandoffError("a handoff must contain at least one tensor")
-        self._arrays = {name: np.ascontiguousarray(value) for name, value in arrays.items()}
-        self._raw = {name: value.tobytes() for name, value in self._arrays.items()}
+        # Keep one immutable contiguous snapshot.  The previous implementation
+        # retained a full bytes copy and made another temporary bytes copy for
+        # every tensor digest, which copied a typical 148 MiB GLM cache twice.
+        self._arrays = {
+            name: np.array(value, copy=True, order="C")
+            for name, value in arrays.items()
+        }
+        for value in self._arrays.values():
+            value.flags.writeable = False
+        self._raw = {
+            name: memoryview(value).cast("B").toreadonly()
+            for name, value in self._arrays.items()
+        }
         aliases = {} if dtype_names is None else dict(dtype_names)
         specs = [
             TensorSpec.from_array(name, value, dtype=aliases.get(name))
@@ -347,10 +391,12 @@ class TensorArchive:
             model_revision=model_revision,
             prompt_sha256=prompt_sha256,
             cached_tokens=cached_tokens,
+            mtp_cached_tokens=mtp_cached_tokens,
+            spark_first_token=spark_first_token,
             tensors=specs,
         )
 
-    def bytes_for(self, name: str) -> bytes:
+    def bytes_for(self, name: str) -> memoryview:
         self.manifest.tensor(name)
         return self._raw[name]
 
@@ -376,7 +422,10 @@ def persist_archive(archive: TensorArchive, root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     if not root.is_dir() or root.is_symlink():
         raise HandoffError("cache bundle root must be a real directory")
-    target = root / archive.manifest.prompt_sha256
+    # A prompt can legitimately produce a different on-disk shape when the
+    # handoff protocol changes.  Keep each protocol in a separate immutable
+    # bundle instead of trying to parse or overwrite a prior protocol's cache.
+    target = root / f"v{PROTOCOL_VERSION}-{archive.manifest.prompt_sha256}"
     incoming = Path(tempfile.mkdtemp(prefix=".incoming-", dir=root))
     try:
         manifest_bytes = archive.manifest.to_bytes()
@@ -492,7 +541,7 @@ class CacheFrame:
     offset: int
     total: int
     segments: tuple[FrameSegment, ...]
-    payload: bytes
+    payload: memoryview
 
 
 def archive_nbytes(manifest: HandoffManifest) -> int:
@@ -591,22 +640,23 @@ def pack_frame(archive: object, offset: int,
     return bytes(raw)
 
 
-def unpack_frame(raw: bytes) -> CacheFrame:
+def unpack_frame(raw: bytes | bytearray | memoryview) -> CacheFrame:
+    view = memoryview(raw).cast("B")
     prefix = len(FRAME_MAGIC) + _HEADER_LENGTH.size
-    if len(raw) <= prefix or raw[:len(FRAME_MAGIC)] != FRAME_MAGIC:
+    if view.nbytes <= prefix or bytes(view[:len(FRAME_MAGIC)]) != FRAME_MAGIC:
         raise HandoffError("cache frame magic is invalid")
-    header_len = _HEADER_LENGTH.unpack_from(raw, len(FRAME_MAGIC))[0]
-    if not 0 < header_len <= MAX_HEADER_BYTES or len(raw) <= prefix + header_len:
+    header_len = _HEADER_LENGTH.unpack_from(view, len(FRAME_MAGIC))[0]
+    if not 0 < header_len <= MAX_HEADER_BYTES or view.nbytes <= prefix + header_len:
         raise HandoffError("cache frame header length is invalid")
     try:
-        header = json.loads(raw[prefix:prefix + header_len].decode("ascii"))
+        header = json.loads(bytes(view[prefix:prefix + header_len]).decode("ascii"))
         if not isinstance(header, dict) or set(header) != {
             "protocol", "transfer_id", "offset", "total", "payload_sha256", "segments"
         }:
             raise HandoffError("cache frame header has unexpected fields")
         if int(header["protocol"]) != PROTOCOL_VERSION:
             raise HandoffError("cache frame protocol is unsupported")
-        payload = raw[prefix + header_len:]
+        payload = view[prefix + header_len:].toreadonly()
         if not payload or len(payload) > MAX_FRAME_BYTES:
             raise HandoffError("cache frame payload size is invalid")
         if hashlib.sha256(payload).hexdigest() != str(header["payload_sha256"]):
@@ -701,7 +751,9 @@ class ChunkAssembler:
     def __init__(self, manifest: HandoffManifest) -> None:
         manifest.validate()
         self.manifest = manifest
-        self._data = {item.name: bytearray() for item in manifest.tensors}
+        self._data = {item.name: bytearray(item.nbytes) for item in manifest.tensors}
+        self._written = {item.name: 0 for item in manifest.tensors}
+        self._verified: set[str] = set()
         self._frame_offset = 0
 
     def accept(self, raw: bytes) -> bool:
@@ -710,14 +762,17 @@ class ChunkAssembler:
             raise HandoffError("chunk belongs to a different handoff")
         spec = self.manifest.tensor(chunk.name)
         data = self._data[chunk.name]
-        if chunk.total != spec.nbytes or chunk.offset != len(data):
+        written = self._written[chunk.name]
+        if chunk.total != spec.nbytes or chunk.offset != written:
             raise HandoffError("chunk size or order differs from the manifest")
-        if len(data) + len(chunk.payload) > spec.nbytes:
+        if written + len(chunk.payload) > spec.nbytes:
             raise HandoffError("chunk exceeds the tensor size")
-        data.extend(chunk.payload)
-        return len(data) == spec.nbytes
+        data[written:written + len(chunk.payload)] = chunk.payload
+        self._written[chunk.name] = written + len(chunk.payload)
+        self._verified.discard(chunk.name)
+        return self._written[chunk.name] == spec.nbytes
 
-    def accept_frame(self, raw: bytes) -> bool:
+    def accept_frame(self, raw: bytes | bytearray | memoryview) -> bool:
         """Verify and append one sequential frame spanning any tensor boundaries."""
 
         frame = unpack_frame(raw)
@@ -732,10 +787,13 @@ class ChunkAssembler:
         cursor = 0
         for segment in frame.segments:
             data = self._data[segment.name]
-            if segment.offset != len(data):
+            written = self._written[segment.name]
+            if segment.offset != written:
                 raise HandoffError("frame tensor order differs from the manifest")
             end = cursor + segment.length
-            data.extend(frame.payload[cursor:end])
+            data[written:written + segment.length] = frame.payload[cursor:end]
+            self._written[segment.name] = written + segment.length
+            self._verified.discard(segment.name)
             cursor = end
         self._frame_offset += len(frame.payload)
         return self._frame_offset == total
@@ -751,10 +809,12 @@ class ChunkAssembler:
 
         spec = self.manifest.tensor(name)
         raw = memoryview(self._data[name]).toreadonly()
-        if raw.nbytes != spec.nbytes:
+        if self._written[name] != spec.nbytes:
             raise HandoffError(f"tensor {name!r} is incomplete")
-        if hashlib.sha256(raw).hexdigest() != spec.sha256:
-            raise HandoffError(f"tensor {name!r} digest mismatch")
+        if name not in self._verified:
+            if hashlib.sha256(raw).hexdigest() != spec.sha256:
+                raise HandoffError(f"tensor {name!r} digest mismatch")
+            self._verified.add(name)
         return raw
 
     def bytes_for(self, name: str) -> bytes:

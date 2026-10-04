@@ -16,8 +16,8 @@ Candidate contribution: the small Metal loader change that reads the tested
 EXL3 checkpoint's dense projections while retaining quantized projections.
 
 Do not open the pull request from the retained 0.6.3 patch as-is. TensorFold
-0.6.4 is now current and the old patch does not apply cleanly. Rebase the idea
-onto current `main`, add a failing-before/passing-after checkpoint test, then
+0.6.5 is now current; the recipe patch has been re-hashed against that release,
+but still needs an upstream-shaped failing-before/passing-after checkpoint test. Then
 attach TensorFold's required exactness, prompt-speed, decode-speed, platform,
 and test receipt. Keep the mixed-machine orchestration out of that pull request.
 

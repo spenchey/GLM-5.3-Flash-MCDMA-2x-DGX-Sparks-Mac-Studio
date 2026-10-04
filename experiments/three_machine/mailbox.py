@@ -16,7 +16,7 @@ import sys
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 CTRL = 4096
 READY_WORD = 64
@@ -26,6 +26,7 @@ SIZES = 256
 DEFAULT_HALF = 4 << 20
 ABI = 1
 _U32 = 0xFFFFFFFF
+_ReplyResult = TypeVar("_ReplyResult")
 
 
 class MailboxError(RuntimeError):
@@ -186,7 +187,20 @@ class ClientMailbox(_Mapped):
     def max_reply(self) -> int:
         return self.reply_bytes - CTRL
 
-    def call(self, payload: bytes | bytearray | memoryview, timeout_s: float = 30.0) -> bytes:
+    def call_consume(
+        self,
+        payload: bytes | bytearray | memoryview,
+        consume: Callable[[memoryview], _ReplyResult],
+        timeout_s: float = 30.0,
+    ) -> _ReplyResult:
+        """Consume one stable reply directly from the mapped reply area.
+
+        The view is valid only for the duration of ``consume``.  Keeping the
+        control-word and generation checks around that callback preserves the
+        same torn-reply protection as :meth:`call` without first copying a
+        large reply into an intermediate ``bytes`` object.
+        """
+
         raw = bytes(payload)
         if not raw or len(raw) > self.max_request:
             raise MailboxError("request is empty or larger than the request half")
@@ -211,12 +225,21 @@ class ClientMailbox(_Mapped):
             raise MailboxError("reply is empty or exceeds the reply half")
         if self._load(READY_WORD) != 1 or self._load(GENERATION_WORD) != self.generation:
             raise MailboxError("MCDMA link generation changed during the request")
-        reply = bytes(self.buffer[self.request_bytes + CTRL:self.request_bytes + CTRL + length])
-        if self._load(self.request_bytes + READY_WORD) != done:
-            raise MailboxError("reply changed while it was copied")
-        if self._load(READY_WORD) != 1 or self._load(GENERATION_WORD) != self.generation:
-            raise MailboxError("MCDMA link generation changed while the reply was copied")
-        return reply
+        reply = self.buffer[
+            self.request_bytes + CTRL:self.request_bytes + CTRL + length
+        ].toreadonly()
+        try:
+            result = consume(reply)
+            if self._load(self.request_bytes + READY_WORD) != done:
+                raise MailboxError("reply changed while it was copied")
+            if self._load(READY_WORD) != 1 or self._load(GENERATION_WORD) != self.generation:
+                raise MailboxError("MCDMA link generation changed while the reply was copied")
+            return result
+        finally:
+            reply.release()
+
+    def call(self, payload: bytes | bytearray | memoryview, timeout_s: float = 30.0) -> bytes:
+        return self.call_consume(payload, bytes, timeout_s)
 
 
 class ServiceMailbox(_Mapped):

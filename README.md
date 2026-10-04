@@ -51,12 +51,16 @@ not described as currently live:
 
 The original proof-first service intentionally supports one non-streaming greedy
 request at a time. It proved the hardware boundary but is not the performance
-target. The accepted capacity path keeps the latest compatible Mia CUDA server
-on both Sparks while official TensorFold 0.6.3 serves eight shared decode
+target. A separate capacity path keeps the latest compatible Mia CUDA server
+on both Sparks while official TensorFold 0.6.3 served eight shared decode
 streams on the Mac from one MCDMA-transferred prompt cache. Across two clean
 sixteen-request campaigns it reached 172.97-173.09 aggregate tokens/s versus
 137.48-137.80 for the same-checkpoint two-Spark service, a 25.7-25.9% median
-paired gain with exact output in every lane.
+paired gain with exact output in every lane. That result does not prove the
+active goal: one request prefilling on both Sparks, moving its real cache over
+MCDMA, and decoding on the Mac faster than the two-Spark service alone. The
+earlier cache-handoff form was slower, and that single-request goal remains
+open under [its own scorecard](docs/GOAL-SINGLE-STREAM-MCDMA.md).
 Temperature sampling, prefix reuse, vision, tool calling, and the full Mia API
 surface are not claimed by this first verified implementation. Prompt plus
 requested output must fit the verified 2,051-position dense context; sparse
@@ -64,13 +68,19 @@ long-context state is not implemented in the split CUDA engine yet.
 
 ## Pinned compatible versions
 
-- Mia recipe: current `main`, commit
-  `cf28cc4f8038be322cdeda220c6f1c8ace8f27d1`; its published Spark image uses
-  TensorFold 0.6.0 with 68 recipe patches.
-- Spark TensorFold: `0.6.0`, patch label `5e01f1bb74d8`.
-- Mac TensorFold: official `0.6.3`, commit
-  `9356df5c424b0c36b7737e37873a6f968b08de79`, plus the checked two-file EXL3
-  dense-stage reader patch.
+- Published two-Spark target: Mia recipe v1.5, commit
+  `1576746a04983b6eded0551dbf22512ee9e95654`; its pinned image uses
+  TensorFold 0.6.0 with 70 recipe patches. Its published C1 one-request
+  measurements are the external performance target; this project does not
+  need another 176 GB copy of Mia's checkpoint merely to restate those claims.
+- Spark TensorFold: `0.6.0`, Mia v1.5 patch label `9f73cca659a1`. A controlled
+  five-request comparison kept this current image for upstream currency, but
+  it improved the one-request median by only about 5 ms and is not presented
+  as a performance win.
+- Mac TensorFold target: official `0.6.5`, commit
+  `609ca419abecebdc5a059498a613680bd3aa847f`, plus the checked two-file EXL3
+  dense-stage reader patch. The retained eight-stream receipt was produced on
+  0.6.3 and is not silently relabeled as a 0.6.5 result.
 - Original layer-split EXL3 model snapshot:
   `9eaebb7c4e96d983dcd538e18624622ba5b820a8`.
 - Exact portable capacity checkpoint on all three hosts:
@@ -79,15 +89,11 @@ long-context state is not implemented in the split CUDA engine yet.
   the older `7192192` tree remains only as the exact base for retained offline
   verification-patch tests.
 
-The Mac and Spark package versions intentionally differ. Mia has not rebased its
-tested CUDA patch stack onto 0.6.3. The official Mac engine needs 0.6.3's current
-shared-round implementation. Each backend therefore uses its newest compatible
-source instead of applying Mia's CUDA patches to an untested base.
-
-TensorFold 0.6.4 was released after this result was certified. This repository
-keeps the exact tested 0.6.3 Mac revision until 0.6.4 passes the same correctness,
-recovery, eight-stream, and paired-capacity gates. A newer upstream release is
-not silently substituted for the verified build.
+The Mac and Spark package versions intentionally differ. Mia's tested CUDA
+recipe remains TensorFold 0.6.0 plus its own 70 patches. The Mac target is the
+current official 0.6.5 Metal engine in an isolated, hash-pinned stage; Mia's
+CUDA patches are never applied to it. A result keeps the engine version it was
+actually measured on, so the older 0.6.3 capacity receipt remains historical.
 
 ## Operate it
 
@@ -118,6 +124,8 @@ deployment, restarts all three machines, and requires an exact model answer.
 ## Evidence and implementation
 
 - [Current architecture](docs/TENSORFOLD-MCDMA-DESIGN.md)
+- [Active single-request performance goal](docs/GOAL-SINGLE-STREAM-MCDMA.md)
+- [MiaAI and tonyd2wild control research](docs/RESEARCH-MIA-TONY-SINGLE-STREAM.md)
 - [Operator runbook](docs/THREE-MACHINE-RUNBOOK.md)
 - [Implementation map](docs/IMPLEMENTATION-MAP.md)
 - [Append-only decisions](docs/DECISIONS.md)

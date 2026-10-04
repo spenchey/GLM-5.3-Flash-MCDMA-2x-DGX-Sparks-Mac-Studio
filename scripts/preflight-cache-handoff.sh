@@ -92,6 +92,13 @@ studio_metadata=$(studio_ssh "'$THREE_MACHINE_STUDIO_PYTHON' '$THREE_MACHINE_STU
 [[ "$studio_metadata" == "$THREE_MACHINE_PORTABLE_MODEL_METADATA_SHA256" ]] \
   || die "the Mac portable-model metadata differs from the pin"
 studio_ssh "PYTHONPATH='$THREE_MACHINE_TENSORFOLD_SOURCE' '$THREE_MACHINE_STUDIO_PYTHON' -c 'import mlx, numpy, tensorfold'"
+studio_ssh "PYTHONPATH='$THREE_MACHINE_TENSORFOLD_SOURCE' '$THREE_MACHINE_STUDIO_PYTHON' -c 'import inspect; from tensorfold.families.glm5_next import load; from tensorfold.families.glm5_next.runtime import GLMDFlash; assert \"drafter\" in inspect.signature(load).parameters; assert GLMDFlash.__name__ == \"GLMDFlash\"'" \
+  || die "Mac TensorFold source does not expose the reviewed GLM DFlash2 runtime"
+studio_ssh "test -r '$THREE_MACHINE_DFLASH_STUDIO_DIR/config.json' && test -r '$THREE_MACHINE_DFLASH_STUDIO_DIR/model.safetensors'" \
+  || die "the reviewed Mac DFlash2 helper is absent"
+dflash_manifest=$(studio_ssh "'$THREE_MACHINE_STUDIO_PYTHON' '$THREE_MACHINE_STUDIO_DIR/scripts/tree-manifest.py' '$THREE_MACHINE_DFLASH_STUDIO_DIR'")
+[[ "$dflash_manifest" == "$THREE_MACHINE_DFLASH_MANIFEST_SHA256" ]] \
+  || die "the Mac DFlash2 helper differs from the reviewed pin"
 tensorfold_source_manifest=$(studio_ssh "'$THREE_MACHINE_STUDIO_PYTHON' '$THREE_MACHINE_STUDIO_DIR/scripts/tree-manifest.py' --exclude-relative .tensorfold-metal-stage.json '$THREE_MACHINE_TENSORFOLD_SOURCE'")
 [[ "$tensorfold_source_manifest" == "$THREE_MACHINE_TENSORFOLD_SOURCE_MANIFEST_SHA256" ]] \
   || die "Mac TensorFold source tree differs from the reviewed pin"

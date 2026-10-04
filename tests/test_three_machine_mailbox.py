@@ -82,6 +82,46 @@ def test_client_call_uses_exact_mailbox_halves():
         os.unlink(path)
 
 
+def test_client_can_consume_a_reply_in_place():
+    path = mailbox_file()
+    try:
+        def peer():
+            with open(path, "r+b") as stream:
+                box = mmap.mmap(stream.fileno(), 0)
+                while int.from_bytes(box[0:8], "little") == 0:
+                    time.sleep(0.0001)
+                word = int.from_bytes(box[0:8], "little")
+                seq = word >> 32
+                response = b"mapped-reply"
+                start = (4 << 20) + CTRL
+                box[start:start + len(response)] = response
+                offset = (4 << 20) + READY_WORD
+                box[offset:offset + 8] = ((seq << 32) | len(response)).to_bytes(8, "little")
+                box.close()
+
+        observed = {}
+
+        def consume(reply):
+            observed["is_memoryview"] = isinstance(reply, memoryview)
+            observed["readonly"] = reply.readonly
+            observed["value"] = bytes(reply)
+            return len(reply)
+
+        thread = threading.Thread(target=peer, daemon=True)
+        thread.start()
+        with ClientMailbox("test", mailbox_path=path, helper=FakeHelper()) as client:
+            assert client.call_consume(b"request", consume, 1.0) == len(b"mapped-reply")
+        thread.join(1)
+        assert not thread.is_alive()
+        assert observed == {
+            "is_memoryview": True,
+            "readonly": True,
+            "value": b"mapped-reply",
+        }
+    finally:
+        os.unlink(path)
+
+
 def test_client_refuses_generation_change():
     path = mailbox_file()
     try:

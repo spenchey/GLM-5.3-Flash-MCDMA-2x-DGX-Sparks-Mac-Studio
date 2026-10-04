@@ -1,5 +1,10 @@
 # Goal: concurrent three-machine GLM serving
 
+> Historical adjacent result: this document proves sixteen-request combined
+> capacity. It does not prove that one Spark-prefilled, MCDMA-transferred,
+> Mac-decoded request beats the two-Spark service. The active performance goal
+> is `GOAL-SINGLE-STREAM-MCDMA.md`.
+
 ## Objective
 
 Prove one reproducible GLM-5.3-Flash capacity service where both DGX Sparks

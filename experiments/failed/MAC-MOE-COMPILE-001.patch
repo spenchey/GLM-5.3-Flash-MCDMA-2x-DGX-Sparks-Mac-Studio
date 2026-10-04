@@ -1,0 +1,28 @@
+diff --git a/src/tensorfold/families/glm5_next/mlp.py b/src/tensorfold/families/glm5_next/mlp.py
+index 4f50505..aa76ac7 100644
+--- a/src/tensorfold/families/glm5_next/mlp.py
++++ b/src/tensorfold/families/glm5_next/mlp.py
+@@ -62,6 +62,7 @@ class MoE:
+         self.fused_ok = MK.moe_fits(self)
+         # the prompt kernels' weights, the shared expert's too (its rows feed the combine); else MLX's ops
+         self.glue_ok = kernel_q(gate, up, down) and (shared is None or getattr(shared, "glue_ok", False))
++        self._compiled: Any = None
+ 
+     def logits(self, x: mx.array, rows_exact: bool) -> mx.array:
+         """Router logits [R, E] in fp32, every row with its one-row matmul's bits on the decode path."""
+@@ -181,6 +182,15 @@ class MoE:
+             from tensorfold.families.glm5_next import stream
+ 
+             return stream.moe(self, x, rows_exact)
++        if not rows_exact:
++            return self.forward(x, False)
++        if self._compiled is None:
++            self._compiled = mx.compile(lambda xs: self.forward(xs, True))
++        return self._compiled(x)
++
++    def forward(self, x: mx.array, rows_exact: bool) -> mx.array:
++        """Resident experts without dispatch; decode calls compile this pure block once per row shape."""
++
+         rows = int(x.shape[0])
+         if rows_exact and "moe" in C.FUSED and self.fused_ok and K.metal() and x.dtype == mx.bfloat16:
+             return MK.moe_rows(self, x)

@@ -179,6 +179,7 @@ def _parse_sse_lines(lines: Sequence[bytes], started: float) -> dict[str, Any]:
     stats: dict[str, Any] = {}
     finish_reason: str | None = None
     saw_done = False
+    chunk_arrivals: list[float] = []
     for raw in lines:
         if not raw.startswith(b"data: "):
             continue
@@ -199,8 +200,11 @@ def _parse_sse_lines(lines: Sequence[bytes], started: float) -> dict[str, Any]:
         choice = choices[0]
         delta = choice.get("delta") or {}
         emitted = (delta.get("reasoning_content") or "") + (delta.get("content") or "")
-        if emitted and first_at is None:
-            first_at = time.perf_counter()
+        if emitted:
+            arrived = time.perf_counter()
+            chunk_arrivals.append(arrived)
+            if first_at is None:
+                first_at = arrived
         if delta.get("content"):
             visible.append(str(delta["content"]))
         if delta.get("reasoning_content"):
@@ -228,6 +232,10 @@ def _parse_sse_lines(lines: Sequence[bytes], started: float) -> dict[str, Any]:
         "text": text,
         "text_sha256": _text_digest(text),
         "finish_reason": finish_reason,
+        # A speculative round can expose several token IDs in one text chunk,
+        # so these are deliberately named client chunks rather than tokens.
+        "client_chunk_seconds": [value - started for value in chunk_arrivals],
+        "runtime": stats,
     }
 
 

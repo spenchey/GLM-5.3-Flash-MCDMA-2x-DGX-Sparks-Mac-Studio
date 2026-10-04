@@ -1,8 +1,8 @@
 {
-  "base": "official TensorFold 0.6.3 commit 9356df5c424b0c36b7737e37873a6f968b08de79",
-  "upstream_tag": "v0.6.3",
-  "upstream_commit": "9356df5c424b0c36b7737e37873a6f968b08de79",
-  "base_tree_sha256": "9875436bcfed030e5c7a63d2934a5af2a99c1cb5cec6d661bad275511d2b30f7",
+  "base": "official TensorFold 0.6.5 commit 609ca419abecebdc5a059498a613680bd3aa847f",
+  "upstream_tag": "v0.6.5",
+  "upstream_commit": "609ca419abecebdc5a059498a613680bd3aa847f",
+  "base_tree_sha256": "1d7f0f5c3251f65d8bc1d653206d449b97a71a5c7f7480948ef002b1d059e302",
   "files": {
     "tensorfold/families/glm5_next/linear.py": {
       "base_sha256": "7d98c757281ea3f26daff0f9298496976318670b21d766e47a9d02630f77d2c2",
@@ -11,8 +11,33 @@
     "tensorfold/families/glm5_next/weights.py": {
       "base_sha256": "cbf7c66e479a970f3f73277737a25e02c48206e85ece5cee1e18accbf71219f1",
       "patched_sha256": "ab0cacee78e91c9f93515514ab065931e2031e45de2e601684df6f2e99b2b344"
+    },
+    "tensorfold/drafters/dflash_drafter.py": {
+      "base_sha256": "2e8144455c28455066a5b16798d1c4a74a54b1eff6416b33eb3f5ee8a5ccfde5",
+      "patched_sha256": "316803c20348e461978883b14333e9d344d94b3dad4517410a45c9307b01ba81"
+    },
+    "tensorfold/families/glm5_next/__init__.py": {
+      "base_sha256": "89c2b41611943412344f2568869e4544e64d11fd74c22b52a2bc03219f9791de",
+      "patched_sha256": "a0b88ddcc3f045664382c07ef99930636867302d26bc67770e74a90a16ad3635"
+    },
+    "tensorfold/families/glm5_next/model.py": {
+      "base_sha256": "6fb551d75d7fdad937c9b2b3eedfccfbf5e8ab2ce27790a8d37ae07af64c1c9c",
+      "patched_sha256": "747ffd8c6ee731778e56cfc5a431130f79b8f424f997aebf9cb3cd2e79603cf7"
+    },
+    "tensorfold/families/glm5_next/runtime.py": {
+      "base_sha256": "a0263c2ed3de77e920e1b04a8723bf282d9c0570279ddc21240a79fbfe366ce0",
+      "patched_sha256": "b7de2227f5db5d4cfe8c26b6ce08d24fd2764fb3b024ad9f85c94a8c67c9af8e"
     }
   },
-  "patch_sha256": "ca8b41b468640726d859f968cc4227e74cad63c7e9617909b3b36f6606caf9ec",
-  "patched_tree_sha256": "72073174bce47f4f2f6e3f7b1f1824ae0e22e4fec46269c421334fa143baf573"
+  "patches": [
+    {
+      "path": "patches/tensorfold/0001-metal-read-exl3-dense-stage.patch",
+      "sha256": "ca8b41b468640726d859f968cc4227e74cad63c7e9617909b3b36f6606caf9ec"
+    },
+    {
+      "path": "patches/tensorfold/0002-glm-dflash2-metal.patch",
+      "sha256": "76ac8a7256598980e494891a9b3cf332000a3a3a366ed08ef398f87188b8b42e"
+    }
+  ],
+  "patched_tree_sha256": "13cf04f5f4975d9f9517f106d4ae993f9fbac0fe1191fb62272c79e80f92b337"
 }

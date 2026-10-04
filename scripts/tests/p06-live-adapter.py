@@ -278,6 +278,10 @@ class Session:
             f">{q(spark_log)} 2>&1 & echo $! >{q(spark_pid)}"
         )
         self.state["spark_pid"] = self.pid(self.spark, spark_pid)
+        # Persist each owned child as soon as it exists.  Startup callers run
+        # cleanup in a separate adapter process, so keeping this only in
+        # memory would orphan the listener when a later startup gate fails.
+        self.save()
         self.wait_until(lambda: self.spark.shell(f"test -S {q(self.spark_socket)}", check=False).returncode == 0,
                         10, "Spark listener socket did not appear")
         self.start_tunnel()
@@ -290,6 +294,7 @@ class Session:
             f">{q(mac_log)} 2>&1 & echo $! >{q(mac_pid)}"
         )
         self.state["mac_pid"] = self.pid(self.mac, mac_pid)
+        self.save()
         self.wait_until(lambda: self.mac.shell(f"test -S {q(self.mac_socket)}", check=False).returncode == 0,
                         10, "Mac connector socket did not appear")
         self.wait_until(lambda: self.status(self.mac, self.mac_socket)["link"] == "up",

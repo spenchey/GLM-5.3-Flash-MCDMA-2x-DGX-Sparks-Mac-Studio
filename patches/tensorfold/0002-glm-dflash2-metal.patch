@@ -1,0 +1,339 @@
+diff --git a/tensorfold/drafters/dflash_drafter.py b/tensorfold/drafters/dflash_drafter.py
+index e36e6c8..98f1b9f 100644
+--- a/tensorfold/drafters/dflash_drafter.py
++++ b/tensorfold/drafters/dflash_drafter.py
+@@ -62,8 +62,18 @@ class DFlashDrafter:
+                         class_predicate=lambda _, m: isinstance(m, nn.Linear) and m.weight.shape[-1] % 64 == 0)
+             mx.eval(self.model.parameters())
+         self.model.bind(target_model)
+-        vendor._patch_model(target_model, list(self.model.config.target_layer_ids))
++        draft_embed = getattr(target_model, "draft_embed_tokens", None)
++        if callable(draft_embed):
++            self.model.embed_tokens = draft_embed
++        capture = getattr(target_model, "capture_layers", None)
++        if callable(capture):
++            capture(self.model.config.target_layer_ids)
++        else:
++            vendor._patch_model(target_model, list(self.model.config.target_layer_ids))
+         self.target = target_model
++        if int(self.model.config.vocab_size) != 248_320:
++            # The shared reduced head below is Qwen's vocabulary layout. Other families keep their whole head.
++            self.draft_vocab = ((0, int(self.model.config.vocab_size)),)
+         self.block_size = int(self.model.config.block_size)
+         self.mask_id = int(self.model.config.mask_token_id)
+         window = getattr(self.model.config, "sliding_window", None)
+@@ -167,15 +177,22 @@ class DFlashDrafter:
+             import mlx.nn as nn
+ 
+             head = self._matmul_head()
+-            if os.environ.get("TF_DRAFT_VOCAB", "") != "full" and isinstance(head, nn.QuantizedLinear) \
+-                    and "bias" not in head and not getattr(head, "_lane_tiled", False):
+-                n = int(head["weight"].shape[0])
++            standard = isinstance(head, nn.QuantizedLinear) and "bias" not in head
++            affine = all(hasattr(head, name) for name in ("weight", "scales", "biases", "bits", "group"))
++            if os.environ.get("TF_DRAFT_VOCAB", "") != "full" and (standard or affine) \
++                    and not getattr(head, "_lane_tiled", False):
++                def field(name: str) -> Any:
++                    return head[name] if standard else getattr(head, name)
++
++                n = int(field("weight").shape[0])
+                 spans = [(a, min(b, n)) for a, b in self.draft_vocab if a < n]
+                 if sum(b - a for a, b in spans) < n:
+-                    parts = [(head["weight"][a:b], head["scales"][a:b], head["biases"][a:b]) for a, b in spans]
++                    parts = [(field("weight")[a:b], field("scales")[a:b], field("biases")[a:b])
++                             for a, b in spans]
+                     ids = mx.concatenate([mx.arange(a, b, dtype=mx.int32) for a, b in spans])
+                     mx.eval(ids)
+-                    self._plain_sub = (parts, ids, int(head.group_size), int(head.bits))
++                    group = int(head.group_size) if standard else int(head.group)
++                    self._plain_sub = (parts, ids, group, int(head.bits))
+         return self._plain_sub
+ 
+     def _sub_head(self) -> tuple[mx.array, mx.array, mx.array, int, int] | None:
+diff --git a/tensorfold/families/glm5_next/__init__.py b/tensorfold/families/glm5_next/__init__.py
+index fd7a3e0..8b44174 100644
+--- a/tensorfold/families/glm5_next/__init__.py
++++ b/tensorfold/families/glm5_next/__init__.py
+@@ -142,8 +142,9 @@ def expert_bytes(model_dir: Path) -> int:
+ 
+ 
+ def load(model_dir: Path, *, mtp_drafts: int | None = None, ssd_experts: float | None = None,
+-         vision: bool = False, vision_urls: bool = False, **_: Any) -> tuple[Any, Any]:
+-    """The MLX engine; ``mtp_drafts`` caps the MTP drafts a round (0: none); ``ssd_experts``: the expert pool's GiB."""
++         drafter: str = "", drafter_bits: int = 4, vision: bool = False, vision_urls: bool = False,
++         **_: Any) -> tuple[Any, Any]:
++    """The MLX engine; optional DFlash2 replaces MTP; ``ssd_experts`` is the expert pool's GiB."""
+ 
+     import mlx.core as mx
+ 
+@@ -155,7 +156,8 @@ def load(model_dir: Path, *, mtp_drafts: int | None = None, ssd_experts: float |
+         limit = int(info.get("max_recommended_working_set_size", 0))
+         if limit:
+             mx.set_wired_limit(limit)
+-    family, tokenizer = load_runtime(Path(model_dir), drafts=mtp_drafts, ssd_experts=ssd_experts)
++    family, tokenizer = load_runtime(Path(model_dir), drafts=mtp_drafts, ssd_experts=ssd_experts,
++                                     drafter=drafter, drafter_bits=drafter_bits)
+     if vision:
+         from tensorfold.vision.glm_mlx import GLMVisionFrontend
+ 
+diff --git a/tensorfold/families/glm5_next/model.py b/tensorfold/families/glm5_next/model.py
+index 7f67427..b81c024 100644
+--- a/tensorfold/families/glm5_next/model.py
++++ b/tensorfold/families/glm5_next/model.py
+@@ -77,6 +77,39 @@ class GLM5:
+         self.norm = norm
+         self.lm_head = lm_head
+         self.last_normed: mx.array | None = None
++        self._hidden_states: list[mx.array | None] | None = None
++        self._tap_at: dict[int, list[int]] = {}
++
++    def capture_layers(self, layer_ids: Any) -> None:
++        """Expose the mean hyper-connection state after selected layers to a DFlash drafter."""
++
++        ids = tuple(int(layer) for layer in layer_ids)
++        if any(layer < 0 or layer >= len(self.layers) for layer in ids):
++            raise ValueError(f"DFlash tap layers {ids} do not fit this {len(self.layers)}-layer model")
++        self._hidden_states = [None] * len(ids)
++        self._tap_at = {}
++        for slot, layer in enumerate(ids):
++            self._tap_at.setdefault(layer, []).append(slot)
++
++    @staticmethod
++    def stream_mean(x: mx.array) -> mx.array:
++        """The target tap CUDA records: the fp32 mean of the hyper-connection streams, returned as [1, R, D]."""
++
++        xs = x.astype(mx.float32)
++        raw = xs[:, 0]
++        for stream in range(1, int(x.shape[1])):
++            raw = raw + xs[:, stream]
++        return (raw * (1.0 / int(x.shape[1]))).astype(x.dtype)[None]
++
++    def _capture_layer(self, layer: int, x: mx.array) -> None:
++        if self._hidden_states is None:
++            return
++        slots = self._tap_at.get(int(layer), ())
++        if not slots:
++            return
++        tapped = self.stream_mean(x)
++        for slot in slots:
++            self._hidden_states[slot] = tapped
+ 
+     def make_cache(self) -> list[Any]:
+         return [KDACache() if layer.is_linear else MLACache() for layer in self.layers]
+@@ -99,6 +132,11 @@ class GLM5:
+         return mx.dequantize(e.weight[ids], e.scales[ids].astype(mx.float32), e.biases[ids].astype(mx.float32),
+                              group_size=e.group, bits=e.bits).astype(C.act())
+ 
++    def draft_embed_tokens(self, tokens: mx.array) -> mx.array:
++        """DFlash's batched embedding view over the same target embedding rows."""
++
++        return self.embed_tokens(tokens).reshape(*tokens.shape, int(self.args.hidden_size))
++
+     def hidden(self, tokens: Any, cache: list[Any], *, inputs_embeds: mx.array | None = None) -> mx.array:
+         """One stream's R consecutive tokens: final-normed hidden states [1, R, D]."""
+ 
+@@ -132,12 +170,17 @@ class GLM5:
+         for i, layer in enumerate(self.layers):
+             layer_caches = [c[i] for c in caches]
+             x, normed, post, comb = self.boundary(x, pending, layer.attn_hc, layer.in_norm, decode)
++            if i:
++                self._capture_layer(i - 1, x)
+             pending = (layer.attn(normed, layer_caches, lengths, decode), post, comb)
+             x, normed, post, comb = self.boundary(x, pending, layer.ffn_hc, layer.post_norm, decode)
+             pending = (layer.mlp(normed, decode), post, comb)
+             if decode and C.EVAL_EVERY and (i + 1) % C.EVAL_EVERY == 0 and i + 1 < len(self.layers):
+                 mx.async_eval(x, *pending)
+-        self.last_normed = self.final_norm(self.boundary(x, pending, None, None, decode)[0])
++        x = self.boundary(x, pending, None, None, decode)[0]
++        if self.layers:
++            self._capture_layer(len(self.layers) - 1, x)
++        self.last_normed = self.final_norm(x)
+         return self.last_normed[None]
+ 
+     def boundary(self, x: mx.array, pending: Any, hc: HC | None, norm: mx.array | None,
+@@ -184,10 +227,14 @@ class GLM5:
+         xs = [mx.contiguous(mx.broadcast_to(h[a:a + n, None, :], (n, streams, width))) for a, n in zip(starts, sizes)]
+         pend: list[Any] = [None] * len(xs)
+         queue = ChunkQueue()
+-        for layer, c in zip(self.layers, cache):
++        for i, (layer, c) in enumerate(zip(self.layers, cache)):
++            entered = [self.boundary(x, pend[j], layer.attn_hc, layer.in_norm, False)
++                       for j, x in enumerate(xs)]
++            if i and self._tap_at.get(i - 1):
++                # Keep each chunk's rows in prompt order, exactly as ``hidden_rows`` presents them.
++                self._capture_layer(i - 1, mx.concatenate([part[0] for part in entered]))
+             mixes = []
+-            for j, x in enumerate(xs):
+-                x, normed, post, comb = self.boundary(x, pend[j], layer.attn_hc, layer.in_norm, False)
++            for j, (x, normed, post, comb) in enumerate(entered):
+                 att = layer.attn(normed, [c], (int(x.shape[0]),), False)
+                 xs[j], normed, post, comb = self.boundary(x, (att, post, comb), layer.ffn_hc, layer.post_norm, False)
+                 mixes.append((normed, post, comb))
+@@ -195,8 +242,10 @@ class GLM5:
+             together = getattr(layer.mlp, "pass_chunks", None)
+             ys = together([m[0] for m in mixes], queue) if together else [layer.mlp(m[0], False) for m in mixes]
+             pend = [(y, post, comb) for y, (_, post, comb) in zip(ys, mixes)]
+-        self.last_normed = mx.concatenate([self.final_norm(self.boundary(x, p, None, None, False)[0])
+-                                           for x, p in zip(xs, pend)])
++        xs = [self.boundary(x, p, None, None, False)[0] for x, p in zip(xs, pend)]
++        if self.layers and self._tap_at.get(len(self.layers) - 1):
++            self._capture_layer(len(self.layers) - 1, mx.concatenate(xs))
++        self.last_normed = mx.concatenate([self.final_norm(x) for x in xs])
+         return self.last_normed[None]
+ 
+     def head(self, hidden: mx.array) -> mx.array:
+diff --git a/tensorfold/families/glm5_next/runtime.py b/tensorfold/families/glm5_next/runtime.py
+index 6749661..683d7b9 100644
+--- a/tensorfold/families/glm5_next/runtime.py
++++ b/tensorfold/families/glm5_next/runtime.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ from pathlib import Path
+-from typing import Any
++from typing import Any, Sequence
+ 
+ import mlx.core as mx
+ import numpy as np
+@@ -430,19 +430,133 @@ class GLMFlash:
+         return True
+ 
+ 
+-def load(model_dir: Path, *, drafts: int | None = None, check: bool = True,
+-         ssd_experts: float | None = None) -> tuple[GLMFlash, Any]:
+-    """The runtime and tokenizer; ``drafts`` (default 3, 0: none) caps the MTP drafts a round."""
++class GLMDFlash(GLMFlash):
++    """The GLM target with DFlash2's verified chain drafter instead of its MTP head."""
++
++    draft_reads_hidden = False
++    speculate_early = False
++
++    def __init__(self, model: GLM5, drafter: Any, *, drafts: int, check: bool = True) -> None:
++        super().__init__(model, None, drafts=drafts, check=check)
++        from tensorfold.families.qwen3_5.dflash_head import DFlashHead
++
++        self.head_drafts = DFlashHead(drafter, nodes=int(drafts), chains=True)
++        self.mtp = drafter                       # The family engine's signal that a verified draft head is present.
++        self.drafts = int(drafts)
++        self.mtp_step_ms = 0.0                   # One DFlash block proposes every node together.
++        self._last: dict[int, tuple[int, int, int]] = {}  # cache id -> (target position, rows, first shared row)
++
++    @staticmethod
++    def _position(cache: list[Any], layers: int) -> int:
++        return next(int(item.offset) for item in cache[:layers] if hasattr(item, "offset"))
++
++    def make_cache(self) -> list[Any]:
++        return [*self.model.make_cache(), self.head_drafts.slot()]
++
++    def adopt_cache(self, cache: list[Any]) -> list[Any]:
++        from tensorfold.families.qwen3_5.dflash_head import DraftSlot
++
++        if not (cache and isinstance(cache[-1], DraftSlot)):
++            cache.append(self.head_drafts.slot())
++        return cache
++
++    def hidden(self, inputs: Any, cache: list[Any], parents: Any = None) -> mx.array:
++        start = self._position(cache, self.layer_count)
++        out = super().hidden(inputs, cache, parents)
++        self._last = {id(cache): (start, int(out.shape[1]), 0)}
++        return out
++
++    def hidden_pass(self, inputs: Any, cache: list[Any], sizes: Any) -> mx.array:
++        start = self._position(cache, self.layer_count)
++        out = super().hidden_pass(inputs, cache, sizes)
++        self._last = {id(cache): (start, int(out.shape[1]), 0)}
++        return out
++
++    def hidden_rows(self, windows: list[Any], caches: list[list[Any]], parents: Any = None) -> mx.array:
++        starts = [self._position(cache, self.layer_count) for cache in caches]
++        lengths = [int(window.reshape(-1).shape[0]) if isinstance(window, mx.array) else len(window)
++                   for window in windows]
++        out = super().hidden_rows(windows, caches, parents)
++        firsts = [sum(lengths[:i]) for i in range(len(lengths))]
++        self._last = {id(cache): (start, rows, first)
++                      for cache, start, rows, first in zip(caches, starts, lengths, firsts)}
++        return out
++
++    def absorb_draft_context(self, hidden: Any, next_tokens: Any, cache: list[Any], start: int = 0) -> None:
++        record = self._last.get(id(cache))
++        if record is None:
++            # An imported target cache has no Mac-side taps yet.  Its first decode forward primes DFlash below.
++            return
++        position, _, first = record
++        count = int(next_tokens.reshape(-1).shape[0]) if isinstance(next_tokens, mx.array) else len(next_tokens)
++        self.head_drafts.absorb(cache, position + int(start), count, first + int(start))
++
++    def _prime_imported(self, cache: list[Any], rows: Sequence[int], sampling: Any) -> list[int]:
++        """Initialize a drafter from the first target rows after a target-only cache handoff."""
++
++        kept = [int(row) for row in rows]
++        proposer = cache[-1].get(sampling)
++        if proposer.ready or not kept:
++            return kept
++        position, _, first = self._last[id(cache)]
++        local = [row - first for row in kept]
++        if local != list(range(local[0], local[0] + len(local))):
++            raise NotImplementedError("GLM DFlash initializes an imported cache from consecutive rows")
++        self.head_drafts.absorb(cache, position + local[0], len(local), kept[0])
++        return []
++
++    def speculate(self, cache: list[Any], tokens: Any, position: int, sampling: Any, start: int = 0,
++                  last_only: bool = False, rows: Sequence[int] | None = None) -> mx.array:
++        follow = [int(token) for token in (tokens.reshape(-1).tolist() if hasattr(tokens, "tolist") else tokens)]
++        _, _, first = self._last[id(cache)]
++        kept = [int(row) for row in rows] if rows is not None else list(
++            range(first + int(start), first + int(start) + len(follow)))
++        kept = self._prime_imported(cache, kept, sampling)
++        self.head_drafts.read(cache, kept, follow, sampling)
++        return mx.array([0], dtype=mx.uint32)             # ``settle`` builds the verified chain after the target read.
++
++    def settle(self, cache: list[Any], keep: int, first: Any, position: int, sampling: Any, count: int) -> Any:
++        return self.head_drafts.tree(cache, position, sampling, count) if count > 0 else []
++
++    def unspeculate(self, cache: list[Any]) -> None:
++        pass
++
++    def draft_streams(self, caches: Sequence[list[Any]], follows: Sequence[Sequence[int]],
++                      rows: Sequence[Sequence[int]], positions: Sequence[int], samplings: Sequence[Any],
++                      depths: Sequence[int]) -> list[Any]:
++        prepared = [self._prime_imported(cache, kept, sampling)
++                    for cache, kept, sampling in zip(caches, rows, samplings)]
++        return self.head_drafts.draft_streams(caches, follows, prepared, positions, samplings, depths)
++
++    def draft_probabilities(self, cache: list[Any]) -> list[float] | None:
++        return self.head_drafts.probabilities(cache)
++
++
++def load(model_dir: Path, *, drafts: int | None = None, check: bool = True, ssd_experts: float | None = None,
++         drafter: str = "", drafter_bits: int = 4) -> tuple[GLMFlash, Any]:
++    """The runtime and tokenizer; an optional DFlash2 helper replaces MTP while preserving target verification."""
+ 
+     from tensorfold.families.glm5_next import has_mtp
+     from tensorfold.families.glm5_next import mtp as mtp_module
+     from tensorfold.families.glm5_next import weights as glm
+ 
+     model, tokenizer = glm.load(Path(model_dir), ssd_experts=ssd_experts)
+-    drafts = 3 if drafts is None else int(drafts)
+-    head = mtp_module.load(model) if drafts > 0 and has_mtp(model_dir) else None
++    if drafter:
++        from tensorfold.drafters.dflash_drafter import DFlashDrafter
++
++        loaded = DFlashDrafter(model, drafter, bits=int(drafter_bits))
++        drafts = min(int(loaded.block_size) - 1, 7) if drafts is None else int(drafts)
++        if drafts < 1:
++            raise ValueError("a DFlash2 drafter needs at least one draft row")
++        head = None
++    else:
++        loaded = None
++        drafts = 3 if drafts is None else int(drafts)
++        head = mtp_module.load(model) if drafts > 0 and has_mtp(model_dir) else None
+     model.weights = None                                                 # the checkpoint's shard index is done
+-    runtime = GLMFlash(model, head, drafts=drafts, check=check)
++    runtime = (GLMDFlash(model, loaded, drafts=drafts, check=check) if loaded is not None
++               else GLMFlash(model, head, drafts=drafts, check=check))
+     print(f"[glm5] exact window {runtime.exact_width} rows, forward ms by width {runtime.window_costs}, "
+-          f"MTP step {runtime.mtp_step_ms} ms, drafts up to {runtime.drafts if runtime.mtp else 0}", flush=True)
++          f"{'DFlash2 block' if loaded is not None else 'MTP step'} {runtime.mtp_step_ms} ms, "
++          f"drafts up to {runtime.drafts if runtime.mtp else 0}", flush=True)
+     return runtime, tokenizer
+

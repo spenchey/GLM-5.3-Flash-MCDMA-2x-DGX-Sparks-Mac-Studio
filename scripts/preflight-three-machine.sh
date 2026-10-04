@@ -92,6 +92,8 @@ worker_model_metadata=$(worker_ssh "python3 '$THREE_MACHINE_PROJECT_DIR/scripts/
   || die "worker Spark model metadata/symlink manifest differs from the pin: $worker_model_metadata"
 studio_ssh "test -r '$THREE_MACHINE_STAGE_MODEL_DIR/config.json' && test -r '$THREE_MACHINE_TENSORFOLD_SOURCE/tensorfold/__init__.py' && test -x '$THREE_MACHINE_STUDIO_PYTHON' && test -r '$THREE_MACHINE_MCDMA_LIBRARY' && test -d '$THREE_MACHINE_STUDIO_DIR'"
 studio_ssh "PYTHONPATH='$THREE_MACHINE_TENSORFOLD_SOURCE' '$THREE_MACHINE_STUDIO_PYTHON' -c 'import mlx, mlx_lm, numpy, tensorfold'"
+studio_ssh "PYTHONPATH='$THREE_MACHINE_TENSORFOLD_SOURCE' '$THREE_MACHINE_STUDIO_PYTHON' -c 'import inspect; from tensorfold.families.glm5_next import load; from tensorfold.families.glm5_next.runtime import GLMDFlash; assert \"drafter\" in inspect.signature(load).parameters; assert GLMDFlash.__name__ == \"GLMDFlash\"'" \
+  || die "Mac TensorFold source does not expose the reviewed GLM DFlash2 runtime"
 
 tensorfold_source_manifest=$(studio_ssh "'$THREE_MACHINE_STUDIO_PYTHON' '$THREE_MACHINE_STUDIO_DIR/scripts/tree-manifest.py' --exclude-relative .tensorfold-metal-stage.json '$THREE_MACHINE_TENSORFOLD_SOURCE'")
 [[ "$tensorfold_source_manifest" == "$THREE_MACHINE_TENSORFOLD_SOURCE_MANIFEST_SHA256" ]] \

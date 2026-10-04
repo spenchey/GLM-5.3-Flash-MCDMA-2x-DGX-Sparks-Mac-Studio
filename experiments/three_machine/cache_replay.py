@@ -36,7 +36,8 @@ def serve(archive: StoredTensorArchive, mailbox_name: str, socket_path: str, tim
                         model_id=request.model_id or "",
                         model_revision=request.model_revision or "",
                         prompt_sha256=prompt_digest(request.tokens),
-                        cached_tokens=len(request.tokens) - 1,
+                        cached_tokens=len(request.tokens),
+                        mtp_cached_tokens=len(request.tokens) - 1,
                     )
                     active = True
                     mailbox.reply(sequence, pack_manifest(archive.manifest))

@@ -328,6 +328,44 @@ class LiveAdapterTest(unittest.TestCase):
         self.assertFalse(result["sigkill_used"])
         self.assertEqual(result["children_alive"], [])
 
+    def test_partial_start_persists_spark_pid_for_cleanup(self) -> None:
+        session = self.make_session("fresh")
+        session.mac = mock.Mock()
+        session.spark = mock.Mock()
+        session.mac.shell.return_value = Result()
+        session.spark.shell.return_value = Result()
+        with mock.patch.object(session, "pid", return_value=222), \
+             mock.patch.object(
+                 session,
+                 "wait_until",
+                 side_effect=ADAPTER.Failure("Spark listener socket did not appear"),
+             ):
+            with self.assertRaisesRegex(ADAPTER.Failure, "Spark listener"):
+                session.ensure_started()
+        persisted = json.loads(session.state_path.read_text())
+        self.assertEqual(persisted["spark_pid"], 222)
+        self.assertFalse(persisted["started"])
+
+    def test_partial_start_persists_both_pids_for_cleanup(self) -> None:
+        session = self.make_session("fresh")
+        session.mac = mock.Mock()
+        session.spark = mock.Mock()
+        session.mac.shell.return_value = Result()
+        session.spark.shell.return_value = Result()
+        with mock.patch.object(session, "pid", side_effect=(222, 111)), \
+             mock.patch.object(session, "start_tunnel"), \
+             mock.patch.object(
+                 session,
+                 "wait_until",
+                 side_effect=(None, ADAPTER.Failure("Mac connector socket did not appear")),
+             ):
+            with self.assertRaisesRegex(ADAPTER.Failure, "Mac connector"):
+                session.ensure_started()
+        persisted = json.loads(session.state_path.read_text())
+        self.assertEqual(persisted["spark_pid"], 222)
+        self.assertEqual(persisted["mac_pid"], 111)
+        self.assertFalse(persisted["started"])
+
     def cleanup_with_predicate_failure(
         self, side: str, fragment: str
     ) -> tuple[dict[str, object], ResidueRemote]:

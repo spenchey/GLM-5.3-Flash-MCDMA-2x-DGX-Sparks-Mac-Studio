@@ -1,7 +1,26 @@
 # Changelog
 
+## 2026-10-04
+
+- Added protocol 4 segment proofs so final cache sealing no longer rereads the
+  complete 148 MB transfer. The retained five-request median improved from
+  6.999 to 6.912 seconds while preserving zero MCDMA failures.
+- Measured MCDMA Spark-push against Mac-pull with the same model, prompt, cache,
+  frame shape, and decode path. Push shortened the median handoff by about 3 ms
+  but did not improve complete time, so the retained configuration stays on
+  pull.
+- Preserved exact canary and five-request evidence, restored the accepted local
+  setting, and verified clean shutdown of every owned process.
+
 ## 2026-10-03
 
+- Added and measured a GLM-compatible Mac DFlash2 path without downloading
+  MiaAI-Lab's base-model checkpoint. It raised median Mac decode to 61.28
+  tokens/s, but the complete cold three-machine request remained slower than
+  Mia's published two-Spark result because the cache handoff added about 0.52 s.
+- Rebased the checked Mac TensorFold stage from 0.6.4 to the newly released
+  0.6.5; GLM family files and the dense-stage patch are unchanged, while the
+  complete source and patched trees have new verified hashes.
 - Certified two repeatable sixteen-request campaigns in which the three-machine
   path reached 172.97-173.09 aggregate tokens/s, 25.7-25.9% above the matched
   two-Spark baseline, with exact output in every lane.
@@ -10,7 +29,7 @@
   home paths, credential patterns, and tracked model artifacts.
 - Split the public recipe from proposed upstream work: one clean MCDMA cleanup
   change can be submitted after its upstream suite passes; the TensorFold
-  loader change must first be rebased and measured on TensorFold 0.6.4.
+  loader change must first be measured and packaged for TensorFold 0.6.5.
 
 ## 2026-10-02
 
