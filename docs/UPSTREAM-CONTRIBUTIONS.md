@@ -12,41 +12,46 @@ copying model weights or complete upstream trees.
 
 ## TensorFold
 
-Candidate contribution: the small Metal loader change that reads the tested
-EXL3 checkpoint's dense projections while retaining quantized projections.
-
-Do not open the pull request from the retained 0.6.3 patch as-is. TensorFold
-0.6.5 is now current; the recipe patch has been re-hashed against that release,
-but still needs an upstream-shaped failing-before/passing-after checkpoint test. Then
-attach TensorFold's required exactness, prompt-speed, decode-speed, platform,
-and test receipt. Keep the mixed-machine orchestration out of that pull request.
+Submitted: [TensorFold PR #385](https://github.com/ashhart/TensorFold/pull/385)
+adds GLM-5.3 Flash DFlash2 support on MLX. It contains the target-layer capture
+interface, GLM embedding and affine-head handling, imported-cache priming, and
+seven focused MLX tests. Those tests passed on the M3 Ultra Studio against
+TensorFold 0.6.5. The pull request does not contain model weights or the
+mixed-machine orchestration.
 
 ## MCDMA
 
-Candidate contribution 1: bounded benchmark cleanup and termination handling.
-The retained `0001-safe-benchmark-cleanup.patch` applies cleanly to current
-MCDMA `main` at `e672c14ff9fc7b38994caf73025cf1588b4de74e`. Run MCDMA's full
-offline suite and submit this as one small pull request with the cleanup-failure
-tests and measured boundary.
+Submitted: [MCDMA PR #15](https://github.com/ashhart/MCDMA/pull/15) accepts
+bandwidth protocol-v3 endpoint descriptors and closes both relay inputs only
+after forwarding the final `CONFIRMED` proof. This fixes the observed v3
+shutdown wait while retaining v1 support. Its focused suite passed 14 tests and
+15 subtests.
 
-Candidate contribution 2: exact verification windows. The retained
-`0002-exact-verification-windows.patch` does not apply cleanly to current
-MCDMA and is not ready to submit. Rebase it, separate unrelated changes, and
-rerun both offline and hardware checks before considering a second pull request.
+The retained safe-cleanup and exact-verification patches remain recipe evidence,
+not upstream submissions. The exact-verification patch does not apply cleanly
+to current MCDMA and still needs separation plus fresh offline and hardware
+checks before it should be proposed.
 
 The three-machine result itself is better shared first as a sanitized MCDMA
 issue or discussion linking this recipe and its receipts. That gives the
 maintainer useful hardware evidence without asking MCDMA to own TensorFold- and
 model-specific orchestration.
 
+## Mia recipe
+
+Submitted: [Mia recipe PR #58](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/58)
+adds an independent qualification note. It preserves Mia's published two-Spark
+baseline, records that the current three-machine single-request candidate is
+still slower end to end, and links the public evidence without changing Mia's
+defaults, patches, images, or measurements.
+
 ## Order
 
-1. Publish and independently clone-test this recipe.
-2. Open the MCDMA cleanup pull request after its upstream suite passes.
-3. Rebase and measure the TensorFold loader change on current `main`, then open
-   its own pull request.
-4. Share the complete three-machine result with both maintainers, linking the
-   public receipts and clearly stating tested versions and limits.
+1. This recipe was published and independently test-scanned.
+2. The focused MCDMA protocol fix was submitted separately.
+3. The focused TensorFold GLM DFlash2 support was submitted separately.
+4. The honest three-machine qualification was submitted to Mia's recipe as
+   documentation, including the current failure to beat its published baseline.
 
 Every submission must retain the credits and licenses in `NOTICE` and
 `CREDITS.md` and must not include private deployment history.
